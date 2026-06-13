@@ -6,6 +6,12 @@ visualization, XOR brute-forcing, magic-byte scanning, and heuristic
 architecture detection. Built for firmware blobs — files are memory-mapped,
 so multi-hundred-MB images open instantly and navigation stays smooth.
 
+> [!NOTE]
+> **Disclaimer:** this is primarily a curiosity / hobby project, and a large
+> portion of the code is AI-generated. It's reasonably tested but has not been
+> battle-hardened — treat it accordingly, and don't rely on it for anything
+> safety- or security-critical without reviewing the code yourself.
+
 ```
 ┌ fw.bin ────────────────────────────────────────────────┐┌───────────────────────────┐
 │00000000  41 4E 44 52 4F 49 44 21  00 00 80 00  ANDROID!││ Marks │ Analysis │ … │    │
@@ -51,8 +57,13 @@ tab of the side pane.
 | `Ctrl-f` / `Ctrl-b`, PgDn / PgUp | full page |
 | `gg` / `G` | start / end of file |
 | `g<hex>g` | seek to hex offset (e.g. `g1845g`) |
+| `Ctrl-o` / `Ctrl-p` | jump list — back / forward through visited positions |
+| `m<key>` / `` `<key> `` | set bookmark / jump to bookmark (`a-z`, `0-9`) |
+| `f` / `F` | follow the 32-/64-bit pointer under the cursor (honours base+endian) |
+| `X` | find xrefs — every pointer in the file that targets the cursor (cycle with `n`/`N`) |
 | `/` | search — hex with wildcards (`de ad ?? ef`) or string (`"text"`, matches ASCII **and** UTF-16LE) |
 | `n` / `N` | next / prev search hit (or diff hunk while a diff is open) |
+| `\` | live-filter the Strings tab (type to narrow; `Enter` jumps to first match) |
 | `{` / `}` | prev / next magic-byte hit |
 | `<` / `>` | smaller / larger side-pane |
 | `v` | visual selection (movement extends; `Esc`/`v` ends) |
@@ -64,7 +75,7 @@ tab of the side pane.
 | `i` | edit mode — type hex nibbles; `Tab` switches to ASCII overtype; `Esc` ends |
 | `u` / `Ctrl-r` | undo / redo (grouped per edit session) |
 | `e` | toggle entropy graph |
-| `Tab` | cycle side-pane tab (Marks → Inspect → Analysis → Entropy → Output) |
+| `Tab` | cycle side-pane tab (Marks → Inspect → Strings → Analysis → Entropy → Output) |
 | `J` / `K` | scroll side pane |
 | `q` | quit / close active file (refuses if unsaved; `:q!` discards) |
 
@@ -80,6 +91,12 @@ tab of the side pane.
 :diff <file> / :diffoff   side-by-side diff; changed/added/removed colored
 :xor / :cyclic            analyze the last visual selection
 :checksum [start end]     CRC32/Adler/MD5/SHA1/SHA256 of a range (default: selection/file)
+:strings [min] [utf16]    list printable strings in the Strings tab
+:follow [u32le|u64be|…]   follow the pointer under the cursor (also f / F)
+:xref [u32le|u64be|…]     find pointers that target the cursor (also X)
+:base <hex>               load base subtracted by follow/xref (firmware @ nonzero base)
+:endian le|be             byte order used by follow/xref (auto-set from ELF)
+:bookmarks  :jumps        list bookmarks / jump-list state
 :e <file>                 open another file in a new tab
 :bn :bp :b <n> :ls        next / prev / nth file; list open files
 :close  :bd[!]            close the active file
@@ -92,11 +109,11 @@ tab of the side pane.
 
 ## Annotations (`.bxa`)
 
-Marks are saved automatically to a JSON sidecar `<binary>.bxa` and reloaded
-next session (with an MD5 mismatch warning if the file changed). The Marks tab
-shows each region's **live** decoded value — it re-decodes through your
-unsaved edits. Annotated bytes are color-coded in the hex view, and labels
-work as `:seek` targets.
+Marks (and bookmarks) are saved automatically to a JSON sidecar `<binary>.bxa`
+and reloaded next session (with an MD5 mismatch warning if the file changed).
+The Marks tab shows each region's **live** decoded value — it re-decodes
+through your unsaved edits. Annotated bytes are color-coded in the hex view,
+and labels work as `:seek` targets.
 
 ## Struct templates (`.bxs`)
 
@@ -155,6 +172,31 @@ analysis. `gt`/`gT` (or `:bn`/`:bp`/`:b <n>`) switch between them, `:ls` lists
 them, `:close` closes one. `:q` closes the active file and only quits once the
 last one is gone (`:qa` quits everything). `:diff` is still the way to compare
 two files byte-for-byte side by side.
+
+## Navigation & xrefs
+
+The moment-to-moment RE loop — jump somewhere, look, come back:
+
+- **Jump list** — every seek, search, follow, bookmark-jump and magic hit is
+  recorded; `Ctrl-o` walks back through where you've been and `Ctrl-p` forward
+  (browser-style history, per file). `:jumps` shows the stack.
+- **Bookmarks** — `m<key>` drops a named position (`a-z`/`0-9`), `` `<key> ``
+  jumps to it, `:bookmarks` lists them.
+- **Follow pointer** — `f`/`F` read the 32-/64-bit value under the cursor and
+  jump there. For images loaded at a non-zero address, set `:base <hex>` and
+  the file offset is computed as `value − base`; `:endian le|be` picks byte
+  order (auto-detected from an ELF header). `:follow u64be` overrides per-call.
+- **Cross-references** — `X` (or `:xref`) scans the whole file for pointers
+  whose value equals the cursor offset (`+ base`), loading them as search hits
+  so `n`/`N` cycle them and they highlight in the hex view. Pointer width and
+  endianness default to the detected ELF class.
+- **Strings** — the **Strings** tab lists printable ASCII (and, with
+  `:strings <min> utf16`, UTF-16LE) runs with offsets; the entry nearest the
+  cursor is highlighted, and the list is windowed so even huge files stay
+  snappy. Press `\` (or `:sfind <text>`) to live-filter the list by substring;
+  `Enter` jumps the cursor to the first match.
+
+Bookmarks persist to the `.bxa` sidecar, so they survive across sessions.
 
 ## Editing model
 

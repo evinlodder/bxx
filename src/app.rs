@@ -32,12 +32,15 @@ pub enum Mode {
     },
     Command,
     Search,
+    /// Live incremental filter of the Strings tab.
+    StrFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideTab {
     Marks,
     Inspect,
+    Strings,
     Analysis,
     Entropy,
     Output,
@@ -47,7 +50,8 @@ impl SideTab {
     pub fn next(self) -> Self {
         match self {
             Self::Marks => Self::Inspect,
-            Self::Inspect => Self::Analysis,
+            Self::Inspect => Self::Strings,
+            Self::Strings => Self::Analysis,
             Self::Analysis => Self::Entropy,
             Self::Entropy => Self::Output,
             Self::Output => Self::Marks,
@@ -82,6 +86,21 @@ pub struct Document {
     pub output_lines: Vec<String>,
     /// Bucketed whole-file entropy, keyed by bucket count (pane height).
     pub entropy_cache: Option<(usize, Vec<(u64, f64)>)>,
+    /// Cursor positions for the jump list (Ctrl-o / Ctrl-p history).
+    pub jump_back: Vec<u64>,
+    pub jump_fwd: Vec<u64>,
+    /// Named bookmarks (`m<key>` to set, `` `<key> `` to jump).
+    pub bookmarks: std::collections::BTreeMap<char, u64>,
+    /// Pointer interpretation for follow / xref: load base, endian, width.
+    pub ptr_base: u64,
+    pub endian_le: bool,
+    pub ptr_width: u8,
+    /// Cached extracted strings + whether the list was truncated.
+    pub strings_cache: Option<(Vec<(u64, String)>, bool)>,
+    pub strings_min: usize,
+    pub strings_utf16: bool,
+    /// Case-insensitive substring filter applied to the Strings tab.
+    pub strings_filter: String,
 }
 
 impl Document {
@@ -112,10 +131,30 @@ impl Document {
             last_selection: None,
             output_lines: Vec::new(),
             entropy_cache: None,
+            jump_back: Vec::new(),
+            jump_fwd: Vec::new(),
+            bookmarks: std::collections::BTreeMap::new(),
+            ptr_base: 0,
+            endian_le: true,
+            ptr_width: 4,
+            strings_cache: None,
+            strings_min: 4,
+            strings_utf16: false,
+            strings_filter: String::new(),
         };
         doc.reanalyze();
+        doc.detect_ptr_defaults();
         doc.load_sidecars();
         Ok(doc)
+    }
+
+    /// Pick sensible pointer width/endian from an ELF header at offset 0.
+    fn detect_ptr_defaults(&mut self) {
+        let h = self.buf.get_range(0, 6);
+        if h.len() == 6 && &h[..4] == b"\x7fELF" {
+            self.ptr_width = if h[4] == 2 { 8 } else { 4 }; // EI_CLASS
+            self.endian_le = h[5] != 2; // EI_DATA: 2 = big-endian
+        }
     }
 
     /// Short name for the file-tab strip.
@@ -156,6 +195,7 @@ impl Document {
         self.arch_hits = arch_hits;
         self.arch_truncated = arch_trunc;
         self.entropy_cache = None;
+        self.strings_cache = None;
     }
 
     fn load_sidecars(&mut self) {
@@ -168,6 +208,7 @@ impl Document {
                 }
                 self.annotations = bxa.regions;
                 self.annotations.sort_by_key(|r| r.start);
+                self.bookmarks = bxa.bookmarks;
             }
             Ok(None) => {}
             Err(e) => self.output_lines.push(format!("bxa load failed: {e}")),
@@ -249,6 +290,8 @@ pub struct App {
     pub mode: Mode,
     /// Accumulated hex digits of a `g<hex>g` seek, if a `g` is pending.
     pub pending_g: Option<String>,
+    /// Awaiting a bookmark key: `Some(true)` to set, `Some(false)` to jump.
+    pub pending_mark: Option<bool>,
     pub cmdline: String,
     pub message: String,
     pub side_tab: SideTab,
@@ -279,6 +322,7 @@ impl App {
             view_rows: 24,
             mode: Mode::Normal,
             pending_g: None,
+            pending_mark: None,
             cmdline: String::new(),
             message: String::new(),
             side_tab: SideTab::Analysis,
@@ -373,12 +417,16 @@ impl App {
         self.mode = Mode::Normal;
         self.side_scroll = 0;
         self.pending_g = None;
+        self.pending_mark = None;
     }
 
     pub fn save_annotations(&mut self) {
-        if let Err(e) =
-            annotations::save_sidecar(&self.buf.path, &self.file_info.md5, &self.annotations)
-        {
+        if let Err(e) = annotations::save_sidecar(
+            &self.buf.path,
+            &self.file_info.md5,
+            &self.annotations,
+            &self.bookmarks,
+        ) {
             self.message = format!("annotation save failed: {e}");
         }
     }
@@ -448,20 +496,35 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::Command | Mode::Search => self.handle_line_input(key),
+            Mode::StrFilter => self.handle_str_filter(key),
             Mode::Edit { ascii } => self.handle_edit(key, ascii),
             Mode::Normal | Mode::Visual => self.handle_normal(key),
         }
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
+        // A pending bookmark key (after `m` or `` ` ``) consumes the next char.
+        if let Some(set) = self.pending_mark.take() {
+            match key.code {
+                KeyCode::Char(c) if c.is_alphanumeric() => {
+                    if set {
+                        self.set_bookmark(c);
+                    } else {
+                        self.goto_bookmark(c);
+                    }
+                }
+                _ => self.message.clear(),
+            }
+            return;
+        }
         // g<hex>g pending sequence takes priority over normal bindings.
         if let Some(digits) = self.pending_g.take() {
             match key.code {
                 KeyCode::Char('g') => {
                     if digits.is_empty() {
-                        self.move_cursor(0); // gg
+                        self.jump_to(0); // gg
                     } else if let Ok(off) = u64::from_str_radix(&digits, 16) {
-                        self.move_cursor(off);
+                        self.jump_to(off);
                         self.message = format!("seek 0x{:X}", self.cursor);
                     }
                 }
@@ -507,8 +570,30 @@ impl App {
             KeyCode::PageUp => {
                 self.move_cursor(self.cursor.saturating_sub(self.view_rows as u64 * cols))
             }
-            KeyCode::Char('G') | KeyCode::End => self.move_cursor(u64::MAX),
-            KeyCode::Home => self.move_cursor(0),
+            KeyCode::Char('G') | KeyCode::End => self.jump_to(u64::MAX),
+            KeyCode::Home => self.jump_to(0),
+            KeyCode::Char('o') if ctrl => self.jump_history(true),
+            KeyCode::Char('p') if ctrl => self.jump_history(false),
+            KeyCode::Char('f') if !ctrl => {
+                let le = self.endian_le;
+                self.follow_pointer(4, le);
+            }
+            KeyCode::Char('F') => {
+                let le = self.endian_le;
+                self.follow_pointer(8, le);
+            }
+            KeyCode::Char('X') => {
+                let (w, le) = (self.ptr_width, self.endian_le);
+                self.find_xrefs(w, le);
+            }
+            KeyCode::Char('m') if self.mode == Mode::Normal => {
+                self.pending_mark = Some(true);
+                self.message = "set bookmark: press a-z / 0-9".into();
+            }
+            KeyCode::Char('`') | KeyCode::Char('\'') => {
+                self.pending_mark = Some(false);
+                self.message = "go to bookmark: press a-z / 0-9".into();
+            }
             KeyCode::Char(':') => {
                 self.leave_visual();
                 self.mode = Mode::Command;
@@ -603,6 +688,13 @@ impl App {
                     SideTab::Entropy
                 };
                 self.side_scroll = 0;
+            }
+            KeyCode::Char('\\') => {
+                self.side_tab = SideTab::Strings;
+                self.side_scroll = 0;
+                self.cmdline = self.strings_filter.clone();
+                self.mode = Mode::StrFilter;
+                self.message = "filter strings — Enter jumps to first match, Esc clears".into();
             }
             KeyCode::Tab => {
                 self.side_tab = self.side_tab.next();
@@ -712,7 +804,7 @@ impl App {
                         .unwrap_or(0);
                     self.search.current = idx;
                     let (s, _) = self.search.hits[idx];
-                    self.move_cursor(s);
+                    self.jump_to(s);
                     self.message = format!("{n} match(es) | n/N to cycle");
                 }
             }
@@ -778,7 +870,7 @@ impl App {
         };
         if let Some(h) = hit {
             let (off, name) = (h.offset, h.name);
-            self.move_cursor(off);
+            self.jump_to(off);
             self.message = format!("{name} @ 0x{off:X}");
         }
     }
@@ -871,5 +963,224 @@ impl App {
         self.diff_buf = Some(other);
         self.message = format!("diff: {n} hunk(s) | n/N to jump, :diffoff to close");
         Ok(())
+    }
+
+    // --- navigation: jump list, bookmarks, follow, xrefs ----------------------
+
+    /// Move the cursor while recording the prior position in the jump list.
+    pub fn jump_to(&mut self, to: u64) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let from = self.cursor;
+        let to = self.clamp(to);
+        if to != from {
+            self.jump_back.push(from);
+            if self.jump_back.len() > 256 {
+                self.jump_back.remove(0);
+            }
+            self.jump_fwd.clear();
+        }
+        self.move_cursor(to);
+    }
+
+    /// Ctrl-o / Ctrl-p: walk the jump list backward / forward.
+    fn jump_history(&mut self, back: bool) {
+        let popped = if back {
+            self.jump_back.pop()
+        } else {
+            self.jump_fwd.pop()
+        };
+        let Some(to) = popped else {
+            self.message = if back {
+                "jump list: at oldest".into()
+            } else {
+                "jump list: at newest".into()
+            };
+            return;
+        };
+        let cur = self.cursor;
+        if back {
+            self.jump_fwd.push(cur);
+        } else {
+            self.jump_back.push(cur);
+        }
+        self.move_cursor(to);
+        self.message = format!("{} 0x{to:X}", if back { "back to" } else { "forward to" });
+    }
+
+    fn set_bookmark(&mut self, key: char) {
+        let at = self.cursor;
+        self.bookmarks.insert(key, at);
+        self.save_annotations(); // persist to .bxa
+        self.message = format!("bookmark '{key}' = 0x{at:X}");
+    }
+
+    fn goto_bookmark(&mut self, key: char) {
+        match self.bookmarks.get(&key).copied() {
+            Some(off) => {
+                self.jump_to(off);
+                self.message = format!("bookmark '{key}' → 0x{off:X}");
+            }
+            None => self.message = format!("no bookmark '{key}'"),
+        }
+    }
+
+    /// Read `width` bytes at the cursor as a pointer and jump to it (minus base).
+    pub fn follow_pointer(&mut self, width: u8, le: bool) {
+        let bytes = self.buf.get_range(self.cursor, width as usize);
+        if bytes.len() < width as usize {
+            self.message = "not enough bytes to follow".into();
+            return;
+        }
+        let value = decode_uint(&bytes, le);
+        let target = value.wrapping_sub(self.ptr_base);
+        if target < self.buf.len() {
+            self.jump_to(target);
+            self.message = format!("follow {}-bit 0x{value:X} → 0x{target:X}", width as u32 * 8);
+        } else {
+            self.message = format!(
+                "0x{value:X} − base 0x{:X} = 0x{target:X} past EOF",
+                self.ptr_base
+            );
+        }
+    }
+
+    /// Find every `width`-byte pointer in the file that targets the cursor.
+    pub fn find_xrefs(&mut self, width: u8, le: bool) {
+        let here = self.cursor;
+        let addr = here.wrapping_add(self.ptr_base);
+        let needle = encode_ptr(addr, width, le);
+        let hits = crate::search::find_bytes(&self.buf, &needle);
+        let n = hits.len();
+        self.search = SearchState {
+            query: format!("xref→0x{here:X}"),
+            hits,
+            current: 0,
+        };
+        if n == 0 {
+            self.message = format!("no {}-bit pointers to 0x{here:X}", width as u32 * 8);
+            return;
+        }
+        let idx = self
+            .search
+            .hits
+            .iter()
+            .position(|&(s, _)| s >= here)
+            .unwrap_or(0);
+        self.search.current = idx;
+        let (s, _) = self.search.hits[idx];
+        self.jump_to(s);
+        self.message = format!("{n} xref(s) to 0x{here:X} | n/N to cycle");
+    }
+
+    /// Extract strings and show them in the Strings tab, jumping to the first.
+    pub fn run_strings(&mut self, min: usize, utf16: bool) {
+        self.strings_min = min.max(1);
+        self.strings_utf16 = utf16;
+        let computed = crate::analysis::strings::extract(self.buf.raw(), self.strings_min, utf16);
+        let n = computed.0.len();
+        let first = computed.0.first().map(|(o, _)| *o);
+        self.strings_cache = Some(computed);
+        self.side_tab = SideTab::Strings;
+        self.side_scroll = 0;
+        if let Some(o) = first {
+            self.jump_to(o);
+        }
+        self.message = format!(
+            "{n} string(s) ≥{}{}",
+            self.strings_min,
+            if utf16 { " (+utf16)" } else { "" }
+        );
+    }
+
+    /// Build the strings list if it hasn't been computed yet.
+    pub fn ensure_strings(&mut self) {
+        if self.strings_cache.is_none() {
+            let computed =
+                crate::analysis::strings::extract(self.buf.raw(), self.strings_min, self.strings_utf16);
+            self.strings_cache = Some(computed);
+        }
+    }
+
+    /// Offset of the first string matching the current filter, if any.
+    pub fn first_string_match(&self) -> Option<u64> {
+        let (list, _) = self.strings_cache.as_ref()?;
+        let q = self.strings_filter.to_lowercase();
+        list.iter()
+            .find(|(_, s)| q.is_empty() || s.to_lowercase().contains(&q))
+            .map(|(o, _)| *o)
+    }
+
+    /// Jump the cursor to the first string matching the filter (for `:sfind`).
+    pub fn jump_to_string_match(&mut self) {
+        self.ensure_strings();
+        self.side_tab = SideTab::Strings;
+        self.side_scroll = 0;
+        match self.first_string_match() {
+            Some(o) => {
+                self.jump_to(o);
+                self.message = format!("filter '{}' → 0x{o:X}", self.strings_filter);
+            }
+            None if self.strings_filter.is_empty() => self.message = "filter cleared".into(),
+            None => self.message = format!("filter '{}': no match", self.strings_filter),
+        }
+    }
+
+    fn handle_str_filter(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.strings_filter.clear();
+                self.cmdline.clear();
+                self.side_scroll = 0;
+                self.mode = Mode::Normal;
+                self.message = "filter cleared".into();
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.cmdline.clear();
+                self.ensure_strings();
+                match self.first_string_match() {
+                    Some(o) => {
+                        self.jump_to(o);
+                        self.message = format!("filter '{}' → 0x{o:X}", self.strings_filter);
+                    }
+                    None => self.message = format!("filter '{}': no match", self.strings_filter),
+                }
+            }
+            KeyCode::Backspace => {
+                self.cmdline.pop();
+                self.strings_filter = self.cmdline.clone();
+                self.side_scroll = 0;
+            }
+            KeyCode::Char(c) => {
+                self.cmdline.push(c);
+                self.strings_filter = self.cmdline.clone();
+                self.side_scroll = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Encode `value` as a little/big-endian pointer of `width` (4 or 8) bytes.
+fn encode_ptr(value: u64, width: u8, le: bool) -> Vec<u8> {
+    if le {
+        value.to_le_bytes()[..width as usize].to_vec()
+    } else {
+        value.to_be_bytes()[8 - width as usize..].to_vec()
+    }
+}
+
+/// Decode up to 8 bytes as an unsigned integer with the given endianness.
+fn decode_uint(bytes: &[u8], le: bool) -> u64 {
+    let w = bytes.len().min(8);
+    let mut buf = [0u8; 8];
+    if le {
+        buf[..w].copy_from_slice(&bytes[..w]);
+        u64::from_le_bytes(buf)
+    } else {
+        buf[8 - w..].copy_from_slice(&bytes[..w]);
+        u64::from_be_bytes(buf)
     }
 }

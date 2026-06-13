@@ -1,6 +1,7 @@
 //! User-defined annotated regions, live value decoding, and `.bxa` sidecar I/O.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -151,6 +152,9 @@ pub struct BxaFile {
     pub version: u32,
     pub file_md5: String,
     pub regions: Vec<Region>,
+    /// Named cursor bookmarks (`m<key>` / `` `<key> ``). Optional for back-compat.
+    #[serde(default)]
+    pub bookmarks: BTreeMap<char, u64>,
 }
 
 pub fn sidecar_path(binary: &Path) -> PathBuf {
@@ -170,12 +174,18 @@ pub fn load_sidecar(binary: &Path) -> Result<Option<BxaFile>, String> {
     Ok(Some(bxa))
 }
 
-pub fn save_sidecar(binary: &Path, md5: &str, regions: &[Region]) -> Result<PathBuf, String> {
+pub fn save_sidecar(
+    binary: &Path,
+    md5: &str,
+    regions: &[Region],
+    bookmarks: &BTreeMap<char, u64>,
+) -> Result<PathBuf, String> {
     let path = sidecar_path(binary);
     let doc = BxaFile {
         version: 1,
         file_md5: md5.to_string(),
         regions: regions.to_vec(),
+        bookmarks: bookmarks.clone(),
     };
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -240,12 +250,17 @@ mod tests {
         }];
         let dir = std::env::temp_dir().join(format!("bx-bxatest-{}", std::process::id()));
         std::fs::write(&dir, b"x").unwrap();
-        let p = save_sidecar(&dir, "d41d8cd98f00b204e9800998ecf8427e", &regions).unwrap();
+        let mut bookmarks = BTreeMap::new();
+        bookmarks.insert('a', 0x10u64);
+        bookmarks.insert('z', 0x2A0u64);
+        let p = save_sidecar(&dir, "d41d8cd98f00b204e9800998ecf8427e", &regions, &bookmarks).unwrap();
         assert!(p.to_string_lossy().ends_with(".bxa"));
         let loaded = load_sidecar(&dir).unwrap().unwrap();
         assert_eq!(loaded.regions.len(), 1);
         assert_eq!(loaded.regions[0].label, "magic");
         assert_eq!(loaded.regions[0].rtype, RegionType::U32Le);
+        assert_eq!(loaded.bookmarks.get(&'a'), Some(&0x10));
+        assert_eq!(loaded.bookmarks.get(&'z'), Some(&0x2A0));
         std::fs::remove_file(p).unwrap();
     }
 

@@ -104,6 +104,16 @@ pub fn run_search(buf: &FileBuffer, input: &str) -> Result<SearchState, String> 
     Ok(state)
 }
 
+/// Find every occurrence of a concrete byte sequence (overlay-aware). Used for
+/// cross-reference scans (e.g. "find pointers equal to this offset").
+pub fn find_bytes(buf: &FileBuffer, needle: &[u8]) -> Vec<(u64, u64)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let pats: Vec<Pat> = needle.iter().map(|&b| Pat::Byte(b)).collect();
+    find_all(buf.raw(), buf, &pats)
+}
+
 /// Scan with overlay applied. The raw mmap slice is the fast path; overlay
 /// bytes are patched into a window copy only around edited offsets — but since
 /// overlays are sparse and scans must see edits, we simply re-check candidate

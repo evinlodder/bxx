@@ -19,6 +19,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Edit { ascii: true } => ("EDIT:ascii", Color::Red),
         Mode::Command => ("COMMAND", Color::Yellow),
         Mode::Search => ("SEARCH", Color::Green),
+        Mode::StrFilter => ("FILTER", Color::Green),
     };
 
     let mut spans = vec![
@@ -80,6 +81,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Mode::Search => Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Green)),
+            Span::raw(app.cmdline.clone()),
+            Span::styled("█", Style::default().fg(Color::Green)),
+        ]),
+        Mode::StrFilter => Line::from(vec![
+            Span::styled("strings filter: ", Style::default().fg(Color::Green)),
             Span::raw(app.cmdline.clone()),
             Span::styled("█", Style::default().fg(Color::Green)),
         ]),

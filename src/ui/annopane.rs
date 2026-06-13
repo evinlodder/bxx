@@ -4,9 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use crate::analysis::entropy;
+use crate::analysis::{entropy, strings};
 use crate::app::{App, SideTab};
 use crate::inspector;
 
@@ -14,39 +14,69 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::bordered();
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [tab_area, body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
-    let titles = ["Marks", "Inspect", "Analysis", "Entropy", "Output"];
+    let titles = ["Marks", "Inspect", "Strings", "Analysis", "Entropy", "Output"];
     let selected = match app.side_tab {
         SideTab::Marks => 0,
         SideTab::Inspect => 1,
-        SideTab::Analysis => 2,
-        SideTab::Entropy => 3,
-        SideTab::Output => 4,
+        SideTab::Strings => 2,
+        SideTab::Analysis => 3,
+        SideTab::Entropy => 4,
+        SideTab::Output => 5,
     };
-    let tabs = Tabs::new(titles.iter().map(|t| Line::from(*t)))
-        .select(selected)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_widget(tabs, tab_area);
+    // Tabs wrap onto as many rows as the pane width needs.
+    let tab_rows = tab_lines(&titles, selected, inner.width);
+    let tab_height = tab_rows.len() as u16;
+    let [tab_area, body] =
+        Layout::vertical([Constraint::Length(tab_height), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(tab_rows), tab_area);
 
-    let lines: Vec<Line> = match app.side_tab {
-        SideTab::Marks => marks_lines(app),
-        SideTab::Inspect => inspect_lines(app),
-        SideTab::Analysis => app.info_lines().into_iter().map(Line::from).collect(),
-        SideTab::Entropy => entropy_lines(app, body),
-        SideTab::Output => app.output_lines.iter().cloned().map(Line::from).collect(),
+    // The Strings list is pre-windowed for speed, so it manages its own scroll.
+    let (lines, scroll): (Vec<Line>, u16) = match app.side_tab {
+        SideTab::Marks => (marks_lines(app), app.side_scroll),
+        SideTab::Inspect => (inspect_lines(app), app.side_scroll),
+        SideTab::Strings => (strings_lines(app, body), 0),
+        SideTab::Analysis => (
+            app.info_lines().into_iter().map(Line::from).collect(),
+            app.side_scroll,
+        ),
+        SideTab::Entropy => (entropy_lines(app, body), app.side_scroll),
+        SideTab::Output => (
+            app.output_lines.iter().cloned().map(Line::from).collect(),
+            app.side_scroll,
+        ),
     };
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((app.side_scroll, 0))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).scroll((scroll, 0)).wrap(Wrap { trim: false }),
         body,
     );
+}
+
+/// Lay tab labels across as many rows as `width` requires (poor-man's wrap,
+/// since ratatui's `Tabs` is single-line).
+fn tab_lines(titles: &[&str], selected: usize, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut row_w = 0usize;
+    for (i, t) in titles.iter().enumerate() {
+        let label = format!(" {t} ");
+        let w = label.chars().count();
+        if row_w > 0 && row_w + w > width {
+            rows.push(Vec::new());
+            row_w = 0;
+        }
+        let style = if i == selected {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        rows.last_mut().unwrap().push(Span::styled(label, style));
+        row_w += w;
+    }
+    rows.into_iter().map(Line::from).collect()
 }
 
 fn marks_lines(app: &App) -> Vec<Line<'static>> {
@@ -90,6 +120,76 @@ fn inspect_lines(app: &App) -> Vec<Line<'static>> {
             ])
         })
         .collect()
+}
+
+fn strings_lines(app: &mut App, body: Rect) -> Vec<Line<'static>> {
+    app.ensure_strings();
+    let cursor = app.cursor;
+    let offset_w = format!("{:X}", app.buf.len().max(0x100)).len().max(8);
+    let q = app.strings_filter.to_lowercase();
+    let (list, trunc) = app.strings_cache.as_ref().unwrap();
+
+    // Apply the live filter (substring, case-insensitive).
+    let filtered: Vec<&(u64, String)> = if q.is_empty() {
+        list.iter().collect()
+    } else {
+        list.iter()
+            .filter(|(_, s)| s.to_lowercase().contains(&q))
+            .collect()
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !app.strings_filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("filter ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.strings_filter.clone(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  ({} match)", filtered.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if filtered.is_empty() {
+        lines.push(Line::from(if app.strings_filter.is_empty() {
+            format!("no strings ≥{} bytes  ( :strings <min> [utf16] )", app.strings_min)
+        } else {
+            "no matches  (\\ to edit, Esc to clear)".to_string()
+        }));
+        return lines;
+    }
+
+    let textw = (body.width as usize).saturating_sub(offset_w + 3).max(8);
+    let height = (body.height as usize).saturating_sub(lines.len()).max(1);
+    let near = filtered.iter().rposition(|(o, _)| *o <= cursor).unwrap_or(0);
+    let start = (app.side_scroll as usize).min(filtered.len().saturating_sub(1));
+
+    for (i, (off, s)) in filtered.iter().enumerate().skip(start).take(height) {
+        let shown: String = s.chars().take(textw).collect();
+        let text_style = if i == near {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.config.color_annotation)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{off:0offset_w$X}  "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(shown, text_style),
+        ]));
+    }
+    if *trunc && q.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("… truncated at {}", strings::MAX_STRINGS),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
 }
 
 fn entropy_lines(app: &mut App, body: Rect) -> Vec<Line<'static>> {

@@ -87,3 +87,66 @@ Misc:
 - Export annotated regions to JSON report
 - Config file (~/.bxrc) for colors, column width, default pane layout
 - cargo install support, include a README with usage
+
+---
+
+# Project ethos (keep in mind for all future work)
+
+- **Fast and lightweight**, but aiming to be better than 010 Editor and as
+  close to a de-facto terminal RE tool as possible.
+- **Pure-cargo, no system packages.** Hand-roll where reasonable (CRC/SHA,
+  parsers, pattern matchers). If a heavy dependency is ever needed
+  (disassembly, decompression), it must be **pure-Rust** and behind a cargo
+  **feature flag** so a minimal build stays tiny.
+- **The hex-view hot path stays untouched.** All analysis is on-demand or in a
+  separate pane; whole-file passes are lazy + cached + windowed. mmap means
+  multi-GB files open instantly.
+- Workflow: build a feature, then verify it live in a PTY (pyte-based harness
+  in /tmp/bxvenv) before calling it done. Keep `cargo clippy --all-targets`
+  clean and all unit tests passing.
+
+# Milestones COMPLETED beyond the original spec
+
+Milestone A — 010-parity features:
+- **Checksum calculator** (`#` / `:checksum [start end]`): Sum8/16/32, XOR8,
+  Adler-32, CRC32, MD5, SHA-1, SHA-256 over selection or whole file. All
+  hand-rolled in `analysis/checksum.rs` (MD5 via existing crate); validated
+  against canonical test vectors.
+- **Data inspector** (Inspect side tab): live decode of bytes at cursor as
+  every int width (signed/unsigned × LE/BE × 8/16/32/64), f32/f64, time_t,
+  hex/oct/bin/ASCII. `inspector.rs`.
+- **Multiple files** (tabs): `App` owns `Vec<Document>` and derefs to the
+  active one (per-file: buf, annotations, search, analysis, cursor, etc.).
+  `bx a b c` opens tabs; `gt`/`gT`, `:e`, `:bn`/`:bp`/`:b<n>`, `:ls`,
+  `:close`; `:q` closes active then quits on last; `:qa`. `--diff` flag
+  preserves the old side-by-side diff. Tab strip across the top.
+
+Milestone B — navigation & xrefs:
+- **Jump list**: `Ctrl-o`/`Ctrl-p` back/forward through seeks/searches/
+  follows/bookmark-jumps/magic hits (browser-history model, per file). `:jumps`.
+- **Bookmarks**: `m<key>` set, `` `<key> `` jump, `:bookmarks` list. **Persisted
+  to the `.bxa` sidecar** (`bookmarks` map, serde default for back-compat).
+- **Follow pointer**: `f`/`F` read 32/64-bit value at cursor and jump
+  (offset = value − `:base`); `:endian le|be`; width/endian auto-detected from
+  an ELF header. `:follow [u32le|…]`.
+- **Cross-references**: `X` / `:xref` scans the file for pointers equal to the
+  cursor offset, loaded as search hits so `n`/`N` cycle them.
+- **Strings pane** (Strings side tab, `analysis/strings.rs`): ASCII + optional
+  UTF-16LE, cached + windowed for speed. Live filter with `\` (or `:sfind`),
+  `Enter` jumps to first match.
+- **Side-tab strip wraps** to multiple rows when too narrow (manual layout;
+  ratatui `Tabs` is single-line).
+
+# Roadmap (next thrusts, in recommended order)
+
+1. **Template/struct language v2** — the core "beat 010/ImHex" lever. Nested
+   structs, arrays sized by earlier fields, enums, bitfields, conditionals,
+   pointers. Pure logic, no heavy deps. (Current `.bxs` is flat only.)
+2. **Disassembly pane** — read-only instruction view at the cursor via
+   pure-Rust `yaxpeax-*`. The leap from "hex editor" to "RE tool". One curated,
+   feature-gated dependency. (Spec said heuristic-only; revisit deliberately.)
+3. **Firmware extraction / transforms** — decompress detected gzip/zlib/lzma/
+   zstd regions into a new tab; CyberChef-lite transform pipeline
+   (XOR/rotate/base64). Optional deps behind a cargo feature.
+4. **Search performance** — replace the naive O(n·m) scan with a memchr-style
+   skip / Boyer-Moore for snappy large-file search.
