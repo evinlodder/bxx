@@ -42,6 +42,7 @@ pub enum SideTab {
     Template,
     Inspect,
     Strings,
+    Triage,
     Transform,
     Analysis,
     Entropy,
@@ -50,11 +51,12 @@ pub enum SideTab {
 
 impl SideTab {
     /// Display order, for the tab strip and next/prev cycling.
-    pub const ORDER: [SideTab; 8] = [
+    pub const ORDER: [SideTab; 9] = [
         Self::Marks,
         Self::Template,
         Self::Inspect,
         Self::Strings,
+        Self::Triage,
         Self::Transform,
         Self::Analysis,
         Self::Entropy,
@@ -122,6 +124,12 @@ pub struct Document {
     pub tx_input: Option<(u64, u64)>,
     pub tx_recipe: Vec<String>,
     pub tx_output: Option<Result<Vec<u8>, String>>,
+    /// Structural triage (sections/symbols/imports), cached; `triage_sel` is
+    /// the highlighted row in the Triage tab.
+    pub triage: Option<crate::analysis::triage::Report>,
+    pub triage_sel: usize,
+    /// Whole-file entropy bucketed to the minimap height, keyed by row count.
+    pub minimap_cache: Option<(usize, Vec<(u64, f64)>)>,
 }
 
 impl Document {
@@ -166,6 +174,9 @@ impl Document {
             tx_input: None,
             tx_recipe: Vec::new(),
             tx_output: None,
+            triage: None,
+            triage_sel: 0,
+            minimap_cache: None,
         };
         doc.reanalyze();
         doc.detect_ptr_defaults();
@@ -221,6 +232,9 @@ impl Document {
         self.arch_truncated = arch_trunc;
         self.entropy_cache = None;
         self.strings_cache = None;
+        self.triage = None;
+        self.triage_sel = 0;
+        self.minimap_cache = None;
     }
 
     fn load_sidecars(&mut self) {
@@ -767,8 +781,21 @@ impl App {
                 self.pending_z = true;
                 self.message = "z: a toggle fold · R expand all · M collapse all".into();
             }
-            KeyCode::Char('J') => self.side_scroll = self.side_scroll.saturating_add(1),
-            KeyCode::Char('K') => self.side_scroll = self.side_scroll.saturating_sub(1),
+            KeyCode::Char('J') => {
+                if self.side_tab == SideTab::Triage {
+                    self.triage_move(1);
+                } else {
+                    self.side_scroll = self.side_scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Char('K') => {
+                if self.side_tab == SideTab::Triage {
+                    self.triage_move(-1);
+                } else {
+                    self.side_scroll = self.side_scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter if self.side_tab == SideTab::Triage => self.triage_jump(),
             KeyCode::Char('<') => {
                 self.config.anno_width = self.config.anno_width.saturating_sub(2).max(15);
             }
@@ -1268,6 +1295,42 @@ impl App {
         match &self.tx_output {
             Some(Ok(v)) => Some(v),
             _ => None,
+        }
+    }
+
+    // --- structural triage ----------------------------------------------------
+
+    pub fn ensure_triage(&mut self) {
+        if self.triage.is_none() {
+            self.triage = crate::analysis::triage::analyze(self.buf.raw());
+        }
+    }
+
+    /// Move the highlighted triage row (J/K on the Triage tab).
+    pub fn triage_move(&mut self, delta: isize) {
+        self.ensure_triage();
+        if let Some(rep) = &self.triage {
+            let n = rep.entries.len() as isize;
+            if n > 0 {
+                self.triage_sel = (self.triage_sel as isize + delta).clamp(0, n - 1) as usize;
+            }
+        }
+    }
+
+    /// Jump the hex cursor to the selected triage entry's file offset (Enter).
+    pub fn triage_jump(&mut self) {
+        self.ensure_triage();
+        let target = self
+            .triage
+            .as_ref()
+            .and_then(|rep| rep.entries.get(self.triage_sel))
+            .and_then(|e| e.offset);
+        match target {
+            Some(off) => {
+                self.jump_to(off);
+                self.message = format!("→ 0x{off:X}");
+            }
+            None => self.message = "this entry has no file offset".into(),
         }
     }
 

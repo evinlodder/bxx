@@ -1,6 +1,7 @@
 mod analysis;
 mod annotations;
 mod app;
+mod bridge;
 mod buffer;
 mod commands;
 mod config;

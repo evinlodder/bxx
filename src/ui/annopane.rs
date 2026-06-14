@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use crate::analysis::{entropy, strings};
+use crate::analysis::{entropy, strings, triage};
 use crate::app::{App, SideTab};
 use crate::inspector;
 
@@ -36,6 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         SideTab::Template => (template_lines(app), app.side_scroll, false),
         SideTab::Inspect => (inspect_lines(app), app.side_scroll, true),
         SideTab::Strings => (strings_lines(app, body), 0, false),
+        SideTab::Triage => (triage_lines(app, body), 0, false),
         SideTab::Transform => (transform_lines(app, body), app.side_scroll, true),
         SideTab::Analysis => (
             app.info_lines().into_iter().map(Line::from).collect(),
@@ -60,6 +61,7 @@ fn tab_title(t: SideTab) -> &'static str {
         SideTab::Template => "Template",
         SideTab::Inspect => "Inspect",
         SideTab::Strings => "Strings",
+        SideTab::Triage => "Triage",
         SideTab::Transform => "Transform",
         SideTab::Analysis => "Analysis",
         SideTab::Entropy => "Entropy",
@@ -111,6 +113,79 @@ fn tab_header_line(titles: &[&str], selected: usize, width: u16) -> Line<'static
     }
     spans.push(Span::styled(if right { ">" } else { " " }.to_string(), arrow));
     Line::from(spans)
+}
+
+fn triage_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    let Some(rep) = &app.triage else {
+        return vec![
+            Line::from("not a recognized executable"),
+            Line::from(""),
+            Line::from("works on ELF — :triage to (re)scan"),
+        ];
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut sel_line = 0usize;
+
+    rows.push(Line::from(vec![
+        Span::styled(
+            rep.format.clone(),
+            Style::default()
+                .fg(app.config.color_annotation)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ({} items · J/K select · ⏎ jump)", rep.entries.len()),
+            dim,
+        ),
+    ]));
+
+    let mut last_kind: Option<triage::Kind> = None;
+    for (i, e) in rep.entries.iter().enumerate() {
+        if Some(e.kind) != last_kind {
+            rows.push(Line::from(Span::styled(
+                e.kind.label(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            last_kind = Some(e.kind);
+        }
+        let selected = i == app.triage_sel;
+        if selected {
+            sel_line = rows.len();
+        }
+        let name_style = if selected {
+            Style::default()
+                .fg(app.config.color_annotation)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(app.config.color_annotation)
+        };
+        let mut spans = vec![
+            Span::styled(if selected { "▸ " } else { "  " }.to_string(), dim),
+            Span::styled(e.name.clone(), name_style),
+        ];
+        if !e.detail.is_empty() {
+            spans.push(Span::styled(format!("  {}", e.detail), dim));
+        }
+        if let Some(a) = e.addr {
+            spans.push(Span::styled(format!("  @0x{a:X}"), Style::default().fg(Color::Cyan)));
+        }
+        if let Some(o) = e.offset {
+            spans.push(Span::styled(format!("  off 0x{o:X}"), dim));
+        }
+        if e.size > 0 {
+            spans.push(Span::styled(format!("  {}B", e.size), dim));
+        }
+        rows.push(Line::from(spans));
+    }
+
+    // window so the selected row stays on screen
+    let height = (body.height as usize).max(1);
+    let max_start = rows.len().saturating_sub(height);
+    let start = sel_line.saturating_sub(height / 2).min(max_start);
+    rows.into_iter().skip(start).take(height).collect()
 }
 
 fn transform_lines(app: &App, body: Rect) -> Vec<Line<'static>> {

@@ -5,4 +5,5 @@ pub mod entropy;
 pub mod headers;
 pub mod magic;
 pub mod strings;
+pub mod triage;
 pub mod xor;

@@ -205,6 +205,51 @@ without restarting. Parse errors report the source line (`ls.bxs:line 3: …`).
 Pattern/string search uses Boyer-Moore-Horspool with a bad-character skip table
 (wildcard-aware), so even multi-hundred-MB files scan in a fraction of a second.
 
+## Triage (structural overview)
+
+`:triage` opens the **Triage** tab — a fast structural map of an executable so
+you can size it up in the terminal *before* loading it into Ghidra. For ELF it
+lists, with the high-signal stuff first:
+
+- **needed libraries** (`DT_NEEDED`) and **imports** (undefined dynamic symbols)
+- **segments** (program headers, with R/W/X flags) and **sections**
+- **symbols** (functions/objects with address, size, type)
+
+`J`/`K` move the highlight, `Enter` jumps the hex cursor to that entry's file
+offset (recorded in the jump list, so `Ctrl-o` brings you back). It's pure
+structure — bx is a companion to Ghidra/binwalk, not a disassembler. *(ELF
+today; PE/Mach-O planned.)*
+
+## Hand off to Ghidra / radare2 *(prototype)*
+
+> [!WARNING]
+> **Prototype / experimental.** This feature works in the common case but
+> hasn't been deeply tested across binaries and tool versions. The
+> offset→address translation, label sanitizing, and generated scripts may not
+> always be correct — **review the output before running it**, and don't rely
+> on it for anything load-bearing yet.
+
+Annotate in bx, then push your work downstream:
+
+```
+:export-ghidra labels.py     # Ghidra Jython script (Script Manager / analyzeHeadless)
+:export-r2 labels.r2         # radare2 script (r2 -i labels.r2 <bin>, or `. labels.r2`)
+```
+
+Both recreate your marks and bookmarks as **labels + comments** at the right
+addresses. bx works in file offsets; the export translates them to virtual
+addresses through the ELF LOAD segments (offsets that aren't in a loadable
+segment are skipped), so a mark at file offset `0x25D10` is meant to land on
+address `0x26D10` in Ghidra.
+
+## File-overview minimap
+
+A thin 010-style strip on the right of the hex view maps the whole file to the
+column height, tinted by entropy (green → yellow → red for compressed/encrypted
+regions), with annotated regions highlighted, a `┃` bracket marking the visible
+window and `▶` at the cursor — so you can see a big firmware image's structure
+and your place in it at a glance. Toggle with `minimap = on|off` in `~/.bxrc`.
+
 ## Transform pipeline (CyberChef-style)
 
 Pipe a selection through an ordered **recipe** of operations and see the result
@@ -293,6 +338,7 @@ contents.
 columns = 16            # bytes per hex row (1-64)
 anno_pane = right       # right | left | off
 anno_width = 44
+minimap = on            # file-overview strip on the right (on | off)
 color.annotation = cyan        # named colors or #rrggbb
 color.cursor = yellow
 color.selection = blue

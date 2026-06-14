@@ -17,6 +17,8 @@ pub struct Config {
     pub anno_pane: AnnoPanePos,
     /// Width of the annotation/analysis side pane in cells.
     pub anno_width: u16,
+    /// Show the file-overview minimap strip on the right of the hex view.
+    pub minimap: bool,
     pub color_annotation: Color,
     pub color_cursor: Color,
     pub color_selection: Color,
@@ -34,6 +36,7 @@ impl Default for Config {
             columns: 16,
             anno_pane: AnnoPanePos::Right,
             anno_width: 44,
+            minimap: true,
             color_annotation: Color::Cyan,
             color_cursor: Color::Yellow,
             color_selection: Color::Blue,
@@ -132,6 +135,17 @@ impl Config {
                     .filter(|&w| w >= 20)
                     .map(|w| cfg.anno_width = w)
                     .is_some(),
+                "minimap" => match value {
+                    "on" | "true" | "yes" => {
+                        cfg.minimap = true;
+                        true
+                    }
+                    "off" | "false" | "no" => {
+                        cfg.minimap = false;
+                        true
+                    }
+                    _ => false,
+                },
                 _ => {
                     if let Some(color_key) = key.strip_prefix("color.") {
                         match (color_key, parse_color(value)) {

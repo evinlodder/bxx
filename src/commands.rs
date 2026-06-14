@@ -57,6 +57,8 @@ pub fn execute(app: &mut App, line: &str) {
         "loadstructs" => cmd_loadstructs(app, &args),
         "reloadstructs" | "reload" => cmd_reload(app),
         "export" => cmd_export(app, &args),
+        "export-ghidra" | "ghidra" => cmd_bridge(app, &args, true),
+        "export-r2" | "r2" => cmd_bridge(app, &args, false),
         "checksum" | "cksum" | "hash" => cmd_checksum(app, &args),
         "transform" | "tx" => app.start_transform(None, args.first().copied()),
         "t" => {
@@ -72,6 +74,16 @@ pub fn execute(app: &mut App, line: &str) {
         "tpatch" => cmd_tpatch(app),
         "pipelines" | "tlist" => cmd_pipelines(app),
         "reloadpipes" | "pipereload" => cmd_reloadpipes(app),
+        "triage" => {
+            app.ensure_triage();
+            if app.triage.is_some() {
+                app.side_tab = SideTab::Triage;
+                app.side_scroll = 0;
+                app.message = "triage — J/K select · Enter jump to offset".into();
+            } else {
+                app.message = "triage: not a recognized executable (ELF supported)".into();
+            }
+        }
         "follow" => cmd_follow(app, &args),
         "xref" | "xrefs" => cmd_xref(app, &args),
         "strings" => cmd_strings(app, &args),
@@ -580,6 +592,45 @@ fn cmd_export(app: &mut App, args: &[&str]) {
     }
 }
 
+/// Export marks + bookmarks as a Ghidra (`ghidra=true`) or radare2 script.
+fn cmd_bridge(app: &mut App, args: &[&str], ghidra: bool) {
+    let tool = if ghidra { "ghidra" } else { "r2" };
+    let Some(out) = args.first() else {
+        app.message = format!("usage: :export-{tool} <file>");
+        return;
+    };
+    if app.annotations.is_empty() && app.bookmarks.is_empty() {
+        app.message = "nothing to export (no marks or bookmarks)".into();
+        return;
+    }
+    app.ensure_triage(); // for offset→vaddr mapping
+    let path = Path::new(out);
+    let res = if ghidra {
+        crate::bridge::write_ghidra(
+            path,
+            &app.buf,
+            &app.annotations,
+            &app.bookmarks,
+            app.triage.as_ref(),
+        )
+    } else {
+        crate::bridge::write_r2(
+            path,
+            &app.buf,
+            &app.annotations,
+            &app.bookmarks,
+            app.triage.as_ref(),
+        )
+    };
+    match res {
+        Ok((n, 0)) => app.message = format!("wrote {n} item(s) to {out} ({tool})"),
+        Ok((n, skip)) => {
+            app.message = format!("wrote {n} item(s) to {out} ({tool}); {skip} unmapped, skipped")
+        }
+        Err(e) => app.message = format!("export: {e}"),
+    }
+}
+
 const HELP: &str = "\
 bx commands:
   :seek <hex|0d<dec>|label>     jump (also g<hex>g, gg, G)
@@ -591,6 +642,7 @@ bx commands:
   :xor / :cyclic                analyze last visual selection (also x / c)
   :checksum [start end]         CRC/MD5/SHA of selection or file (also #)
   :strings [min] [utf16]        list strings (Strings tab) · \\ or :sfind to filter
+  :triage                       sections/symbols/imports (Triage tab; J/K, ⏎ jump)
   :transform [pipe] (also T)    pipe a selection through transforms (Transform tab)
   :t <op>  :tpop :tclear        add/remove recipe steps · :tsave <f> · :tpatch
   :pipelines / :reloadpipes     list / re-read named recipes (~/.bxpipes)
@@ -598,6 +650,7 @@ bx commands:
   :base <hex> / :endian le|be   pointer load base / byte order for follow+xref
   :bookmarks / :jumps           list bookmarks · jump-list state
   :export <file.json>           JSON report of annotations
+  :export-ghidra / :export-r2   marks+bookmarks as a Ghidra / r2 script
   files: :e <f> open · :bn/:bp/:b<n> switch · :ls list · :close · gt/gT
   :w [file] | :q | :q! | :wq | :qa    write / quit
   :info :template :inspect :entropy :help   side-pane tabs

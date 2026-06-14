@@ -190,13 +190,43 @@ Milestone D — search performance + transform pipeline:
   companion to binwalk (extraction) and ghidra/equivalents (disassembly), not a
   do-everything tool. `pipe zcat`/`pipe unsquashfs` covers ad-hoc decompression
   without bundling codecs. (User decision, milestone D.)
+- **Full disassembly pane is OUT.** bx is a companion to Ghidra/IDA/Binary
+  Ninja, not a competitor in the disassembly/decompilation space. (User decision,
+  milestone E.) The *only* disasm we might ever add is a tiny optional
+  single-instruction decode under the cursor in the Inspector — not a pane, not
+  a feature we lead with.
+- **Guiding north star:** make the RE *fast in the terminal*, then hand off
+  cleanly to Ghidra/binwalk. "Triage here, deep-dive there."
 
-# Roadmap (next thrusts — reordered by the user)
+# Roadmap
 
-1. **Disassembly pane** — read-only instruction view at the cursor via
-   pure-Rust `yaxpeax-*`. The leap from "hex editor" to "RE tool". One curated,
-   feature-gated dependency. (Spec said heuristic-only; revisit deliberately.)
-   NOTE: keep the "companion, not do-everything" ethos in mind.
-2. **Possible polish** (only if wanted): interactive 3-pane transform overlay
-   (vs current tab); reorder recipe steps; `:applystruct` cap/depth in `.bxrc`;
-   window the Marks tab for huge applies; struct browser.
+## Milestone E (DONE) — triage & Ghidra hand-off + file overview
+1. **Structural triage pane** — `analysis/triage.rs` + Triage side tab.
+   Parses ELF (32/64, LE/BE): segments, sections, symbols (.symtab/.dynsym),
+   imports (undefined dynsyms), needed libs (DT_NEEDED). Display order puts
+   high-signal info (libs/imports) first, the big symbol list last. `J`/`K`
+   move the highlight, `Enter` (`triage_jump`) jumps the hex cursor to the
+   entry's file offset. Cached per-doc (`triage`/`triage_sel`), cleared on
+   reanalyze. Pure structure — NO disasm. (PE/Mach-O still TODO.)
+2. **File overview minimap** — `ui/minimap.rs`, a 2-col strip carved off the
+   RIGHT of the hex view (not in diff mode; only when width allows). Whole file
+   → column height, tinted by entropy (own `minimap_cache` keyed by row count
+   to avoid thrashing the Entropy tab's cache), annotations highlighted, `┃`
+   viewport bracket + `▶` cursor marker. Config `minimap = on|off` in `.bxrc`.
+3. **Ghidra / radare2 bridge** — `bridge.rs`; `:export-ghidra <f>` (Jython:
+   createLabel + setEOLComment) and `:export-r2 <f>` (`f`/`CCu`). Recreates
+   marks + bookmarks at the right ADDRESSES: file offset→vaddr via the triage
+   `Report::off_to_vaddr` (ELF LOAD segments); offsets outside any LOAD are
+   skipped/counted. Verified: offset 0x25D10 → addr 0x26D10 on /bin/ls.
+   Labels sanitized to [A-Za-z0-9_]; comments one-lined.
+   **STATUS: PROTOTYPE / experimental** (user decision) — works in the common
+   case but not deeply tested across binaries/tool versions; flagged as such in
+   the README. Don't treat offset→addr translation or script output as
+   guaranteed-correct yet; needs hardening before it's load-bearing.
+
+## Milestone F (DEFERRED) — smarter diff + polish
+- Alignment-aware binary diff (survives inserted/deleted bytes, not just
+  positional) + similarity score; diff two regions in one file.
+- Polish bundle: regex / range search + search history; fill / paste-bytes
+  editing; built-in `.bxs` templates for common formats (ELF/PNG/ZIP); session
+  restore.
