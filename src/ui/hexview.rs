@@ -86,13 +86,20 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, side: Side) {
                     .add_modifier(Modifier::BOLD);
             }
         }
-        if diff_active && let Some(h) = diff::hunk_at(&app.diff_hunks, off) {
-            let bg = match h.kind {
-                HunkKind::Changed => app.config.color_diff_changed,
-                HunkKind::Added => app.config.color_diff_added,
-                HunkKind::Removed => app.config.color_diff_removed,
+        if diff_active {
+            // Each pane is coloured by its own file's hunks (alignment-aware).
+            let hunks = match side {
+                Side::DiffRight => &app.diff_hunks_b,
+                Side::Main => &app.diff_hunks,
             };
-            style = style.bg(bg).fg(Color::Black);
+            if let Some(h) = diff::hunk_at(hunks, off) {
+                let bg = match h.kind {
+                    HunkKind::Changed => app.config.color_diff_changed,
+                    HunkKind::Added => app.config.color_diff_added,
+                    HunkKind::Removed => app.config.color_diff_removed,
+                };
+                style = style.bg(bg).fg(Color::Black);
+            }
         }
         if side == Side::Main {
             if app.search.hit_at(off) {

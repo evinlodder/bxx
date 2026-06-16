@@ -73,15 +73,29 @@ pub fn parse_hex_pattern(input: &str) -> Result<Vec<Pat>, String> {
     Ok(pats)
 }
 
-/// Search query: `/de ad ?? ef` = hex pattern, `/"text"` = string search
-/// (matches both ASCII and UTF-16LE encodings of the text).
+/// Search query:
+/// - `de ad ?? ef` — hex pattern with `??` wildcards
+/// - `"text"` — string (ASCII **and** UTF-16LE), case-sensitive
+/// - `i"text"` — case-insensitive ASCII string
+/// - `re:pattern` — regex over bytes (requires the `regex` build feature)
 pub fn run_search(buf: &FileBuffer, input: &str) -> Result<SearchState, String> {
     let input = input.trim();
     let mut state = SearchState {
         query: input.to_string(),
         ..Default::default()
     };
-    if let Some(text) = input.strip_prefix('"') {
+    if let Some(rest) = input.strip_prefix("re:") {
+        state.hits = find_regex(buf, rest)?;
+    } else if let Some(text) = input
+        .strip_prefix('i')
+        .and_then(|r| r.strip_prefix('"'))
+    {
+        let text = text.strip_suffix('"').unwrap_or(text);
+        if text.is_empty() {
+            return Err("empty string query".into());
+        }
+        state.hits = find_string_ci(buf, text);
+    } else if let Some(text) = input.strip_prefix('"') {
         let text = text.strip_suffix('"').unwrap_or(text);
         if text.is_empty() {
             return Err("empty string query".into());
@@ -102,6 +116,54 @@ pub fn run_search(buf: &FileBuffer, input: &str) -> Result<SearchState, String> 
         state.hits = find_all(buf.raw(), buf, &pats);
     }
     Ok(state)
+}
+
+/// Case-insensitive ASCII string search (overlay-aware).
+fn find_string_ci(buf: &FileBuffer, text: &str) -> Vec<(u64, u64)> {
+    let needle: Vec<u8> = text.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    let n = needle.len();
+    let raw = buf.raw();
+    let len = raw.len();
+    if n == 0 || len < n {
+        return Vec::new();
+    }
+    let dirty = buf.has_unsaved_changes();
+    let mut hits = Vec::new();
+    for start in 0..=(len - n) {
+        let ok = needle.iter().enumerate().all(|(i, &nb)| {
+            let b = if dirty {
+                buf.get((start + i) as u64).unwrap_or(0)
+            } else {
+                raw[start + i]
+            };
+            b.to_ascii_lowercase() == nb
+        });
+        if ok {
+            hits.push((start as u64, (start + n) as u64));
+        }
+    }
+    hits
+}
+
+#[cfg(feature = "regex")]
+fn find_regex(buf: &FileBuffer, pattern: &str) -> Result<Vec<(u64, u64)>, String> {
+    let re = regex::bytes::Regex::new(pattern).map_err(|e| format!("regex: {e}"))?;
+    let owned;
+    let data: &[u8] = if buf.has_unsaved_changes() {
+        owned = buf.get_range(0, buf.len() as usize);
+        &owned
+    } else {
+        buf.raw()
+    };
+    Ok(re
+        .find_iter(data)
+        .map(|m| (m.start() as u64, m.end() as u64))
+        .collect())
+}
+
+#[cfg(not(feature = "regex"))]
+fn find_regex(_buf: &FileBuffer, _pattern: &str) -> Result<Vec<(u64, u64)>, String> {
+    Err("regex search not built in (rebuild with --features regex)".into())
 }
 
 /// Find every occurrence of a concrete byte sequence (overlay-aware). Used for
@@ -256,6 +318,28 @@ mod tests {
         assert_eq!(s.prev(2), Some((8, 9))); // wrap back
         assert!(s.hit_at(8));
         assert!(!s.hit_at(9));
+    }
+
+    #[test]
+    fn case_insensitive_string() {
+        let buf = fixture(b"xxABCyyabcZZAbC", "ci");
+        let s = run_search(&buf, "i\"abc\"").unwrap();
+        assert_eq!(s.hits, vec![(2, 5), (7, 10), (12, 15)]);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn regex_search_when_enabled() {
+        let buf = fixture(b"a12b345c", "re");
+        let s = run_search(&buf, "re:[0-9]+").unwrap();
+        assert_eq!(s.hits, vec![(1, 3), (4, 7)]);
+    }
+
+    #[cfg(not(feature = "regex"))]
+    #[test]
+    fn regex_errors_when_disabled() {
+        let buf = fixture(b"abc", "nore");
+        assert!(run_search(&buf, "re:abc").unwrap_err().contains("regex"));
     }
 
     #[test]

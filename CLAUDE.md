@@ -1,4 +1,4 @@
-Build a terminal binary analysis tool in Rust called "bx".
+Build a terminal binary analysis tool in Rust called "bxx".
 
 UI & Layout:
 - ratatui + crossterm TUI with a configurable pane layout:
@@ -117,7 +117,7 @@ Milestone A — 010-parity features:
   hex/oct/bin/ASCII. `inspector.rs`.
 - **Multiple files** (tabs): `App` owns `Vec<Document>` and derefs to the
   active one (per-file: buf, annotations, search, analysis, cursor, etc.).
-  `bx a b c` opens tabs; `gt`/`gT`, `:e`, `:bn`/`:bp`/`:b<n>`, `:ls`,
+  `bxx a b c` opens tabs; `gt`/`gT`, `:e`, `:bn`/`:bp`/`:b<n>`, `:ls`,
   `:close`; `:q` closes active then quits on last; `:qa`. `--diff` flag
   preserves the old side-by-side diff. Tab strip across the top.
 
@@ -186,11 +186,11 @@ Milestone D — search performance + transform pipeline:
   after Strings).
 
 # Decisions / scope notes
-- **In-place extraction / decompression is intentionally OUT.** bx is a
+- **In-place extraction / decompression is intentionally OUT.** bxx is a
   companion to binwalk (extraction) and ghidra/equivalents (disassembly), not a
   do-everything tool. `pipe zcat`/`pipe unsquashfs` covers ad-hoc decompression
   without bundling codecs. (User decision, milestone D.)
-- **Full disassembly pane is OUT.** bx is a companion to Ghidra/IDA/Binary
+- **Full disassembly pane is OUT.** bxx is a companion to Ghidra/IDA/Binary
   Ninja, not a competitor in the disassembly/decompilation space. (User decision,
   milestone E.) The *only* disasm we might ever add is a tiny optional
   single-instruction decode under the cursor in the Inspector — not a pane, not
@@ -224,9 +224,46 @@ Milestone D — search performance + transform pipeline:
    the README. Don't treat offset→addr translation or script output as
    guaranteed-correct yet; needs hardening before it's load-bearing.
 
-## Milestone F (DEFERRED) — smarter diff + polish
-- Alignment-aware binary diff (survives inserted/deleted bytes, not just
-  positional) + similarity score; diff two regions in one file.
-- Polish bundle: regex / range search + search history; fill / paste-bytes
-  editing; built-in `.bxs` templates for common formats (ELF/PNG/ZIP); session
-  restore.
+## Milestone F (DONE — 1.0 shipped) — smarter diff + polish + release
+COMPLETED: search history (↑/↓), case-insensitive (`i"…"`) + scoped (`v` then
+`/`) + feature-gated regex (`re:`) search; yank/paste/fill (`y`/`p`/`:fill`,
+OSC52 clipboard); built-in `.bxs` templates (`builtins.rs`: elf64/32, png/gif/
+bmp/zip/gzip) merged into every doc; alignment-aware diff (`diff.rs` difflib
+matching-blocks → per-side hunks + similarity %, positional fallback >2MiB);
+`--version`; robustness sweep (no panics, batch + TUI). Release prep: Cargo.toml
+metadata (v1.0.0, MIT OR Apache-2.0, repo/keywords/categories/rust-version 1.87/
+exclude), LICENSE-MIT + LICENSE-APACHE, CHANGELOG.md, README front-page;
+`cargo publish --dry-run` passes (40 files, CLAUDE.md excluded).
+NOTE: crate+binary = `bxx` (file formats kept `.bx*`); `bx` was taken on
+crates.io. Repo = github.com/evinlodder/bx. Not yet committed/published — user
+to commit + `cargo publish` (needs their crates.io token).
+
+Original plan/decisions for reference:
+Decisions: **license = MIT OR Apache-2.0** (dual). **regex = feature-gated**
+(pure-Rust `regex` behind a cargo feature, OFF by default; standard build stays
+tiny). **clipboard = OSC52** (escape sequence, no dep, works over SSH).
+
+Part 1 — smarter diff:
+- Alignment-aware diff (rolling-hash / content-defined anchors) that survives
+  inserted/deleted bytes, not just positional. Similarity % in status bar.
+  Diff two regions within one file. Keep positional diff as a fast fallback;
+  cap the alignment work and degrade gracefully on huge files.
+
+Part 2 — polish bundle:
+- Search: history (↑/↓ recall of `/` and `:` queries), search-in-selection/
+  range, case-insensitive string search. Regex (`/re:…`) behind the feature.
+- Editing: `y` yank selection to clipboard via OSC52 (hex / C-array / raw /
+  base64); `:fill <hex>` fill a selection; paste/overwrite yanked bytes.
+- Built-in `.bxs` templates embedded for common formats (ELF/PE/PNG/ZIP/GIF) so
+  `:applystruct elf64` works with no sidecar.
+- (optional/low-pri) session restore.
+
+Part 3 — 1.0 ship checklist:
+- Cargo.toml metadata: description, license = "MIT OR Apache-2.0", repository,
+  homepage, keywords, categories, readme, rust-version (edition 2024 ⇒ ≥1.85),
+  exclude. Add LICENSE-MIT + LICENSE-APACHE. Version → 1.0.0. CHANGELOG.md.
+- `--version` flag. Robustness/no-panic sweep on truncated/malformed/empty/huge
+  inputs. README finalized as the crates.io front page (cargo install, features,
+  the prototype + AI-generated disclaimers, license section).
+- `cargo publish --dry-run`. NOTE: crate name `bxx` may be taken on crates.io —
+  user to confirm / pick a fallback (bxhex, bxx-hex, …) before publishing.

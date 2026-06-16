@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     // scroll; the rest use the shared scroll offset with wrapping.
     let (lines, scroll, wrap): (Vec<Line>, u16, bool) = match app.side_tab {
         SideTab::Marks => (marks_lines(app, body), 0, false),
-        SideTab::Template => (template_lines(app), app.side_scroll, false),
+        SideTab::Template => (template_lines(app, body), 0, false),
         SideTab::Inspect => (inspect_lines(app), app.side_scroll, true),
         SideTab::Strings => (strings_lines(app, body), 0, false),
         SideTab::Triage => (triage_lines(app, body), 0, false),
@@ -274,34 +274,88 @@ fn transform_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
     out
 }
 
-fn template_lines(app: &App) -> Vec<Line<'static>> {
-    let desc = app.template.describe();
-    if desc.is_empty() {
+fn template_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    let entries = app.template.entries();
+    if entries.is_empty() {
         return vec![
-            Line::from("no .bxs template loaded"),
+            Line::from("no templates loaded"),
             Line::from(""),
-            Line::from("auto-loads <file>.bxs, or :loadstructs <file>"),
+            Line::from("built-ins ship in; auto-loads <file>.bxs,"),
+            Line::from("or :loadstructs <file|dir>"),
             Line::from("then :applystruct <name> at the cursor"),
         ];
     }
-    desc.into_iter()
-        .map(|s| {
-            // Definition headers (struct/enum/bitfield/}) start in column 0.
-            let header = s
-                .starts_with("struct ")
-                || s.starts_with("enum ")
-                || s.starts_with("bitfield ")
-                || s == "}";
-            let style = if header {
-                Style::default()
-                    .fg(app.config.color_annotation)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Line::from(Span::styled(s, style))
-        })
-        .collect()
+    let dim = Style::default().fg(Color::DarkGray);
+    let sel_style = |base: Style, selected: bool| {
+        if selected {
+            base.add_modifier(Modifier::REVERSED)
+        } else {
+            base
+        }
+    };
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut node = 0usize; // index among visible foldable nodes
+    let mut sel_row = 0usize;
+    let mut last_source: Option<String> = None;
+
+    for e in &entries {
+        if last_source.as_deref() != Some(e.source.as_str()) {
+            let collapsed = app.template_collapsed.contains(&e.source);
+            let selected = node == app.template_sel;
+            if selected {
+                sel_row = rows.len();
+            }
+            let glyph = if collapsed { "▸" } else { "▾" };
+            rows.push(Line::from(vec![Span::styled(
+                format!("{glyph} ── {} ──", e.source),
+                sel_style(
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    selected,
+                ),
+            )]));
+            node += 1;
+            last_source = Some(e.source.clone());
+        }
+        if app.template_collapsed.contains(&e.source) {
+            continue; // source folded → hide its definitions
+        }
+        let key = format!("{}\0{}", e.source, e.name);
+        let collapsed = app.template_collapsed.contains(&key);
+        let selected = node == app.template_sel;
+        if selected {
+            sel_row = rows.len();
+        }
+        let glyph = if collapsed { "▸" } else { "▾" };
+        let head_style = sel_style(
+            Style::default()
+                .fg(app.config.color_annotation)
+                .add_modifier(Modifier::BOLD),
+            selected,
+        );
+        if collapsed {
+            // one-liner: `▸ struct png { … }`
+            rows.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), dim),
+                Span::styled(format!("{} … }}", e.header), head_style),
+            ]));
+        } else {
+            rows.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), dim),
+                Span::styled(e.header.clone(), head_style),
+            ]));
+            for b in &e.body {
+                rows.push(Line::from(Span::styled(format!("    {b}"), dim)));
+            }
+        }
+        node += 1;
+    }
+
+    // window so the selected node stays on screen
+    let height = (body.height as usize).max(1);
+    let max_start = rows.len().saturating_sub(height);
+    let start = sel_row.saturating_sub(height / 2).min(max_start);
+    rows.into_iter().skip(start).take(height).collect()
 }
 
 fn marks_lines(app: &App, body: Rect) -> Vec<Line<'static>> {

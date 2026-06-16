@@ -60,8 +60,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray),
     ));
     if app.diff_buf.is_some() {
+        let hunks = app.diff_hunks.len() + app.diff_hunks_b.len();
         spans.push(Span::styled(
-            format!("  DIFF:{} hunks", app.diff_hunks.len()),
+            format!(
+                "  DIFF {:.0}% {hunks}h{}",
+                app.diff_similarity * 100.0,
+                if app.diff_aligned { "" } else { "~" }
+            ),
             Style::default().fg(Color::Yellow),
         ));
     }

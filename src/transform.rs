@@ -3,7 +3,7 @@
 //! A *recipe* is an ordered list of operation strings (e.g. `["unbase64",
 //! "xor 5a", "pipe zcat"]`); data flows through each step. Built-in ops are
 //! pure-Rust and dependency-free. Two escape hatches give users their own
-//! transforms without recompiling bx:
+//! transforms without recompiling bxx:
 //!
 //! - **named pipelines** in `~/.bxpipes` (`name = op | op | …`) compose the
 //!   built-ins into reusable recipes, and
@@ -198,7 +198,7 @@ fn hex_decode(data: &[u8]) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn b64_encode(data: &[u8]) -> Vec<u8> {
+pub fn b64_encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [

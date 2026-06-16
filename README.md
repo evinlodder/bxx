@@ -1,10 +1,22 @@
-# bx
+# bxx
 
-A terminal binary analysis tool for reverse engineers: vim-style hex
-viewer/editor with annotations, struct templates, diffing, entropy
-visualization, XOR brute-forcing, magic-byte scanning, and heuristic
-architecture detection. Built for firmware blobs — files are memory-mapped,
-so multi-hundred-MB images open instantly and navigation stays smooth.
+A fast terminal hex editor and reverse-engineering workbench. `bxx` pairs a
+vim-style hex/ASCII viewer-editor with the things you actually need to take a
+binary apart:
+
+- **annotations & a struct/template language** (`.bxs`) with nested structs,
+  dynamic arrays, enums, bitfields, conditionals, and built-in templates
+- **structural triage** — ELF sections / segments / symbols / imports, jumpable
+- a **CyberChef-style transform pipeline** (`base64`, `xor`, hashes, external
+  `pipe`, named recipes)
+- **search** (wildcards, strings, case-insensitive, optional regex), checksums,
+  a data inspector, entropy + magic-byte + heuristic-arch analysis
+- **alignment-aware diffing** with a similarity score, and a **Ghidra / radare2
+  hand-off**
+
+Files are memory-mapped, so multi-hundred-MB firmware images open instantly. It
+aims to be a fast terminal **companion** to Ghidra and binwalk — triage here,
+deep-dive there — not a replacement for either.
 
 > [!NOTE]
 > **Disclaimer:** this is primarily a curiosity / hobby project, and a large
@@ -24,24 +36,33 @@ so multi-hundred-MB images open instantly and navigation stays smooth.
 ## Install
 
 ```sh
+cargo install bxx              # from crates.io (the binary is `bxx`)
+
+# or from source:
 cargo install --path .
-# or just
-cargo build --release   # binary at target/release/bx
+cargo build --release          # binary at target/release/bxx
+
+# optional regex search (/re:…):
+cargo install bxx --features regex
 ```
 
-Pure-cargo dependencies only (ratatui, crossterm, memmap2, md5, serde).
+Pure-cargo dependencies only (ratatui, crossterm, memmap2, md5, serde) — the
+optional `regex` feature is the only extra, and it's off by default. Requires
+Rust ≥ 1.87.
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
 
 ## Usage
 
 ```sh
-bx file.bin              # open in the TUI
-bx a.bin b.bin c.bin     # open several files as tabs (gt/gT to switch)
-bx --diff a.bin b.bin    # open with a side-by-side diff
-bx file.bin --batch      # headless: print file info, magic hits, parsed
+bxx file.bin              # open in the TUI
+bxx a.bin b.bin c.bin     # open several files as tabs (gt/gT to switch)
+bxx --diff a.bin b.bin    # open with a side-by-side diff
+bxx file.bin --batch      # headless: print file info, magic hits, parsed
                          # headers and arch summary to stdout, then exit
 ```
 
-On load, bx computes the file's size, MD5, Shannon entropy and detected type,
+On load, bxx computes the file's size, MD5, Shannon entropy and detected type,
 scans the **entire file** for magic signatures (embedded images included), and
 runs the heuristic architecture pattern scan. Results land in the **Analysis**
 tab of the side pane.
@@ -61,8 +82,9 @@ tab of the side pane.
 | `m<key>` / `` `<key> `` | set bookmark / jump to bookmark (`a-z`, `0-9`) |
 | `f` / `F` | follow the 32-/64-bit pointer under the cursor (honours base+endian) |
 | `X` | find xrefs — every pointer in the file that targets the cursor (cycle with `n`/`N`) |
-| `/` | search — hex with wildcards (`de ad ?? ef`) or string (`"text"`, matches ASCII **and** UTF-16LE) |
+| `/` | search — hex wildcards (`de ad ?? ef`), string (`"text"`, ASCII **and** UTF-16LE), case-insensitive (`i"text"`), or regex (`re:…`, needs the `regex` feature). `/` from a selection scopes to it. |
 | `n` / `N` | next / prev search hit (or diff hunk while a diff is open) |
+| `↑` / `↓` (in `/` or `:`) | recall previous / next search or command from history |
 | `\` | live-filter the Strings tab (type to narrow; `Enter` jumps to first match) |
 | `{` / `}` | prev / next magic-byte hit |
 | `<` / `>` | smaller / larger side-pane |
@@ -72,13 +94,15 @@ tab of the side pane.
 | `c` | cyclic / repeating-structure detection on the selection |
 | `#` | checksums (CRC32/MD5/SHA1/SHA256/…) of the selection, or whole file |
 | `T` | open the selection in the transform pipeline (Transform tab) |
+| `y` / `p` | yank selection to the clipboard (hex, via OSC52) / paste-overwrite at cursor |
 | `gt` / `gT` | switch to next / previous open file |
 | `i` | edit mode — type hex nibbles; `Tab` switches to ASCII overtype; `Esc` ends |
 | `u` / `Ctrl-r` | undo / redo (grouped per edit session) |
 | `e` | toggle entropy graph |
-| `za` / `zR` / `zM` | toggle fold at cursor / expand all / collapse all (Marks tree) |
+| `za` / `zR` / `zM` | toggle fold / expand all / collapse all (Marks tree, or the selected node on the Template tab) |
 | `Tab` / `Shift-Tab` | next / previous side-pane tab (the header is a scrolling carousel) |
-| `J` / `K` | scroll side pane |
+| `J` / `K` | scroll side pane — or move the selection on the Triage / Template tabs |
+| `Enter` | Triage: jump to the selected entry · Template: fold/unfold the selected struct/source |
 | `q` | quit / close active file (refuses if unsaved; `:q!` discards) |
 
 ## Commands
@@ -89,11 +113,16 @@ tab of the side pane.
                                      u32le u32be u64le u64be float str raw
 :unmark <label>
 :applystruct <name>       lay a struct template down at the cursor
-:loadstructs <file.bxs>   load extra struct definitions
-:diff <file> / :diffoff   side-by-side diff; changed/added/removed colored
+:loadstructs <file|dir>   load a .bxs file, or every .bxs in a directory
+:reloadstructs            re-read the <file>.bxs sidecar after editing it
+:diff <file> / :diffoff   alignment-aware side-by-side diff (n/N jump hunks)
 :xor / :cyclic            analyze the last visual selection
 :checksum [start end]     CRC32/Adler/MD5/SHA1/SHA256 of a range (default: selection/file)
-:strings [min] [utf16]    list printable strings in the Strings tab
+:strings [min] [utf16]    list printable strings in the Strings tab (\ / :sfind to filter)
+:triage                   sections/symbols/imports of an executable (Triage tab)
+:transform [pipe]         transform a selection (also T); :t <op>, :tpop, :tclear,
+                          :tsave <f>, :tpatch, :pipelines, :reloadpipes
+:export-ghidra / :export-r2   export marks + bookmarks as a Ghidra / r2 script
 :follow [u32le|u64be|…]   follow the pointer under the cursor (also f / F)
 :xref [u32le|u64be|…]     find pointers that target the cursor (also X)
 :base <hex>               load base subtracted by follow/xref (firmware @ nonzero base)
@@ -103,10 +132,13 @@ tab of the side pane.
 :bn :bp :b <n> :ls        next / prev / nth file; list open files
 :close  :bd[!]            close the active file
 :export <report.json>     JSON report: file info + annotations with parsed values
+:yank [hex|c|raw|base64]  copy the selection to the clipboard (also y)
+:paste                    overwrite at the cursor from the yank register (also p)
+:fill <hex>               fill the selection with a repeating byte pattern
 :w [file]                 write patches in place, or a patched copy to [file]
 :revert                   discard unsaved edits in the active file
 :q  :q!  :wq  :qa[!]      quit-or-close / discard / write+quit / quit all
-:info :inspect :entropy :help    switch side-pane tabs
+:info :template :inspect :entropy :help    switch side-pane tabs
 ```
 
 ## Annotations (`.bxa`)
@@ -158,11 +190,20 @@ field — nested labels like `Header.entries[0].name`, enum fields show their
 variant name, bitfields show each group's value. (The original flat syntax
 still works unchanged.)
 
+**Built-in templates** ship with `bxx`, so `:applystruct png` works on any PNG
+with no sidecar: `elf64_header` / `elf32_header` / `elf64_phdr`, `png`, `gif`,
+`bmp`, `zip_local`, `gzip` (and the enums/bitfields they use). Your own
+`<file>.bxs` definitions override the built-ins by name.
+
 The **Marks** tab renders the result as a **collapsible tree** with
 indentation; nested structs and arrays are auto-collapsed so you see the shape
 first, then drill in with `za` (toggle the fold at the cursor), `zR` (expand
 all) and `zM` (collapse all). The **Template** tab (`:template`) shows the
-loaded `.bxs` definitions, so you don't have to remember what's in the file.
+loaded definitions **grouped by source** (`── built-in ──`, `── yourfile.bxs ──`,
+…) as a **foldable tree** — structs are collapsed to one line by default;
+`J`/`K` move the selection and `Enter` (or `za`/`zR`/`zM`) folds the selected
+struct or whole source group, so you can see what's available and where it
+came from without scrolling past every field.
 
 Handy extras: `:applystruct <name> <offset>` applies at a hex offset or mark
 label without seeking first (e.g. `:applystruct Phdr e_phoff`); re-applying a
@@ -217,7 +258,7 @@ lists, with the high-signal stuff first:
 
 `J`/`K` move the highlight, `Enter` jumps the hex cursor to that entry's file
 offset (recorded in the jump list, so `Ctrl-o` brings you back). It's pure
-structure — bx is a companion to Ghidra/binwalk, not a disassembler. *(ELF
+structure — bxx is a companion to Ghidra/binwalk, not a disassembler. *(ELF
 today; PE/Mach-O planned.)*
 
 ## Hand off to Ghidra / radare2 *(prototype)*
@@ -229,7 +270,7 @@ today; PE/Mach-O planned.)*
 > always be correct — **review the output before running it**, and don't rely
 > on it for anything load-bearing yet.
 
-Annotate in bx, then push your work downstream:
+Annotate in bxx, then push your work downstream:
 
 ```
 :export-ghidra labels.py     # Ghidra Jython script (Script Manager / analyzeHeadless)
@@ -237,7 +278,7 @@ Annotate in bx, then push your work downstream:
 ```
 
 Both recreate your marks and bookmarks as **labels + comments** at the right
-addresses. bx works in file offsets; the export translates them to virtual
+addresses. bxx works in file offsets; the export translates them to virtual
 addresses through the ELF LOAD segments (offsets that aren't in a loadable
 segment are skipped), so a mark at file offset `0x25D10` is meant to land on
 address `0x26D10` in Ghidra.
@@ -285,16 +326,25 @@ Built-in ops (pure-Rust, no deps): `hex`/`unhex`, `base64`/`unbase64`,
 
   Load one with `:transform <name>`; `:pipelines` lists them in the Output
   panel; `:reloadpipes` re-reads the file so edits take effect without
-  restarting bx.
+  restarting bxx.
+
+## Diffing
+
+`bxx --diff a b` (or `:diff <file>`) opens two files side by side. The diff is
+**alignment-aware** — it tracks inserted/deleted bytes (difflib-style matching
+blocks) rather than comparing positionally, so a few inserted bytes don't
+cascade into "everything after is different." A **similarity score** shows in
+the status bar (`DIFF 91% 1h`), each pane is colored by its own
+changed/added/removed regions, and `n`/`N` jump between hunks. Very large files
+fall back to a fast positional compare (shown with a `~`).
 
 ## Multiple files
 
-Open several files at once (`bx a b c`, or `:e <file>` while running); each is
+Open several files at once (`bxx a b c`, or `:e <file>` while running); each is
 a tab in the strip across the top with its own cursor, annotations, search and
 analysis. `gt`/`gT` (or `:bn`/`:bp`/`:b <n>`) switch between them, `:ls` lists
 them, `:close` closes one. `:q` closes the active file and only quits once the
-last one is gone (`:qa` quits everything). `:diff` is still the way to compare
-two files byte-for-byte side by side.
+last one is gone (`:qa` quits everything).
 
 ## Navigation & xrefs
 
@@ -329,6 +379,37 @@ patching. Edits live in an overlay (the mapped file is untouched) until `:w`
 patches the file in place or `:w copy.bin` writes a patched copy. Modified
 bytes are highlighted; undo/redo is unlimited. Diff mode compares on-disk
 contents.
+
+## Security
+
+`bxx` is meant for inspecting **untrusted** binaries, so it's built to handle
+hostile input safely:
+
+- **Offline.** It makes no network connections — it only reads the files you
+  open and its config in your home directory.
+- **Memory-safe.** Pure safe Rust except a single read-only `mmap`; the whole
+  parsing/analysis surface is fuzz-tested to never panic, overflow, hang, or
+  over-allocate on malformed, truncated, or adversarial input (template
+  field counts, recursion, string/array lengths, and all format parsers are
+  bounded). A malicious file can't corrupt memory or run code.
+- **Sidecars are inert data.** `<file>.bxa` (annotations) and `<file>.bxs`
+  (templates) are auto-loaded but contain no executable logic — `.bxa` is plain
+  JSON, and the `.bxs` template language has no scripting. They do nothing until
+  you act on them (`:applystruct`), and even then it's bounded data layout.
+
+Two features run **commands you provide** — treat them like a shell:
+
+- **`pipe <cmd>`** transforms and named recipes in `~/.bxpipes` run the shell
+  command you type/configure (like vim's `!filter`). Only use commands and
+  recipes you trust.
+- The **Ghidra/r2 export** *(prototype)* sanitizes labels and comments before
+  writing, but it generates scripts that run in another tool — review them
+  before running.
+
+The optional `regex` feature uses the linear-time `regex` crate (no
+catastrophic-backtracking / ReDoS). One inherent caveat: because files are
+memory-mapped, another process truncating a file while it's open can raise
+`SIGBUS` — a robustness limitation of `mmap`, not a memory-safety hole.
 
 ## Config (`~/.bxrc`)
 

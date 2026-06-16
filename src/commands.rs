@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::annotations::{Region, RegionType};
-use crate::app::{App, SideTab};
+use crate::app::{App, SideTab, YankFmt};
 use crate::export;
 
 /// Jump-target syntax: annotation label, `0x` hex, `0d` decimal, bare hex.
@@ -51,6 +51,7 @@ pub fn execute(app: &mut App, line: &str) {
         "diffoff" => {
             app.diff_buf = None;
             app.diff_hunks.clear();
+            app.diff_hunks_b.clear();
             app.message = "diff closed".into();
         }
         "applystruct" => cmd_applystruct(app, &args),
@@ -60,6 +61,9 @@ pub fn execute(app: &mut App, line: &str) {
         "export-ghidra" | "ghidra" => cmd_bridge(app, &args, true),
         "export-r2" | "r2" => cmd_bridge(app, &args, false),
         "checksum" | "cksum" | "hash" => cmd_checksum(app, &args),
+        "yank" | "y" => cmd_yank(app, &args),
+        "paste" => app.paste(),
+        "fill" => cmd_fill(app, &args),
         "transform" | "tx" => app.start_transform(None, args.first().copied()),
         "t" => {
             if args.is_empty() {
@@ -301,23 +305,74 @@ fn cmd_applystruct(app: &mut App, args: &[&str]) {
 }
 
 fn cmd_loadstructs(app: &mut App, args: &[&str]) {
-    let Some(file) = args.first() else {
-        app.message = "usage: :loadstructs <file.bxs>".into();
+    let Some(arg) = args.first() else {
+        app.message = "usage: :loadstructs <file.bxs | directory>".into();
         return;
     };
-    match std::fs::read_to_string(file) {
-        Ok(text) => match crate::structs::parse(&text) {
-            Ok(tpl) => {
-                let mut names = tpl.struct_names();
-                names.sort_unstable();
-                let summary = names.join(", ");
-                app.template.merge(tpl);
-                app.message = format!("loaded: {summary}");
+    let path = Path::new(arg);
+    // Gather the .bxs files to load (a directory loads all of its .bxs files).
+    let files: Vec<PathBuf> = if path.is_dir() {
+        match std::fs::read_dir(path) {
+            Ok(rd) => {
+                let mut v: Vec<PathBuf> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "bxs"))
+                    .collect();
+                v.sort();
+                v
             }
-            Err(e) => app.message = format!("{file}: {e}"),
-        },
-        Err(e) => app.message = format!("{file}: {e}"),
+            Err(e) => {
+                app.message = format!("{arg}: {e}");
+                return;
+            }
+        }
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if files.is_empty() {
+        app.message = format!("{arg}: no .bxs files found");
+        return;
     }
+
+    let (mut loaded, mut total_defs, mut errors) = (0usize, 0usize, Vec::new());
+    for f in &files {
+        match std::fs::read_to_string(f) {
+            Ok(text) => match crate::structs::parse(&text) {
+                Ok(mut tpl) => {
+                    tpl.set_source(&f.file_name().unwrap_or(f.as_os_str()).to_string_lossy());
+                    total_defs += tpl.struct_names().len();
+                    app.template.merge(tpl);
+                    loaded += 1;
+                }
+                Err(e) => errors.push(format!("{}: {e}", f.display())),
+            },
+            Err(e) => errors.push(format!("{}: {e}", f.display())),
+        }
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            app.output_lines.push(e.clone());
+        }
+    }
+    app.message = if files.len() > 1 {
+        format!(
+            "loaded {loaded}/{} file(s), {total_defs} struct(s){}",
+            files.len(),
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" — {} error(s), see Output", errors.len())
+            }
+        )
+    } else if let Some(e) = errors.first() {
+        e.clone()
+    } else {
+        format!("loaded {total_defs} struct(s)")
+    };
+    app.autocollapse_template();
+    app.side_tab = SideTab::Template;
+    app.side_scroll = 0;
 }
 
 /// Re-read the `<binary>.bxs` sidecar from scratch (picks up edits, drops
@@ -329,12 +384,19 @@ fn cmd_reload(app: &mut App) {
     let path = std::path::PathBuf::from(os);
     match std::fs::read_to_string(&path) {
         Ok(text) => match crate::structs::parse(&text) {
-            Ok(tpl) => {
-                let mut names = tpl.struct_names();
-                names.sort_unstable();
-                let summary = names.join(", ");
-                app.template = tpl;
-                app.message = format!("reloaded {}: {summary}", path.display());
+            Ok(mut tpl) => {
+                let n = tpl.struct_names().len();
+                tpl.set_source(&path.file_name().unwrap_or(path.as_os_str()).to_string_lossy());
+                // Rebuild from the built-ins so they survive the reload.
+                let mut base = crate::structs::Template::default();
+                if let Ok(mut b) = crate::structs::parse(crate::builtins::BUILTINS) {
+                    b.set_source("built-in");
+                    base.merge(b);
+                }
+                base.merge(tpl);
+                app.template = base;
+                app.autocollapse_template();
+                app.message = format!("reloaded {} ({n} struct(s))", path.display());
             }
             Err(e) => app.message = format!("{}: {e}", path.display()),
         },
@@ -434,6 +496,61 @@ fn cmd_reloadpipes(app: &mut App) {
         app.output_lines.push(w.clone());
     }
     app.message = format!("reloaded ~/.bxpipes: {n} pipeline(s)");
+}
+
+fn cmd_yank(app: &mut App, args: &[&str]) {
+    let Some(range) = app.last_selection else {
+        app.message = "yank: no selection (v to select first)".into();
+        return;
+    };
+    let fmt = match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("hex") => YankFmt::Hex,
+        Some("c") | Some("carray") => YankFmt::CArray,
+        Some("raw") => YankFmt::Raw,
+        Some("base64") | Some("b64") => YankFmt::Base64,
+        Some(o) => {
+            app.message = format!("yank: unknown format '{o}' (hex|c|raw|base64)");
+            return;
+        }
+    };
+    app.yank(range, fmt);
+}
+
+fn cmd_fill(app: &mut App, args: &[&str]) {
+    let Some(range) = app.last_selection else {
+        app.message = "fill: no selection (v to select first)".into();
+        return;
+    };
+    let Some(pattern) = parse_hex_bytes(&args.join("")) else {
+        app.message = "usage: :fill <hex>  (e.g. :fill 00, :fill deadbeef)".into();
+        return;
+    };
+    app.fill(range, &pattern);
+}
+
+/// Parse a run-together / spaced hex string into bytes (`de ad`, `0xdead`).
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let h: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace("0x", "")
+        .replace("0X", "");
+    if h.is_empty() || !h.len().is_multiple_of(2) {
+        return None;
+    }
+    let hexval = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    h.as_bytes()
+        .chunks(2)
+        .map(|p| Some((hexval(p[0])? << 4) | hexval(p[1])?))
+        .collect()
 }
 
 /// Parse `u32le` / `u32be` / `u64le` / `u64be` into `(width, little_endian)`.
@@ -632,12 +749,12 @@ fn cmd_bridge(app: &mut App, args: &[&str], ghidra: bool) {
 }
 
 const HELP: &str = "\
-bx commands:
+bxx commands:
   :seek <hex|0d<dec>|label>     jump (also g<hex>g, gg, G)
   :mark <start> <end> <label> <type>   annotate region (end exclusive)
   :unmark <label>               remove a mark, or a whole applied struct
   :applystruct <name> [off]     parse a struct at cursor or offset/label
-  :loadstructs <f> / :reloadstructs   load defs / re-read <file>.bxs after editing
+  :loadstructs <file|dir> / :reloadstructs   load .bxs (or all in a dir) / re-read sidecar
   :diff <file> / :diffoff       side-by-side diff (n/N jump hunks)
   :xor / :cyclic                analyze last visual selection (also x / c)
   :checksum [start end]         CRC/MD5/SHA of selection or file (also #)
@@ -656,6 +773,8 @@ bx commands:
   :info :template :inspect :entropy :help   side-pane tabs
 keys: hjkl move · v select · i edit · u undo · C-r redo · C-o/C-p jump back/fwd
       m<k> set bookmark · `<k> jump · f/F follow ptr 32/64 · X xrefs-to-here
-      za toggle fold · zR expand all · zM collapse all (Marks tree)
-      / search ('?? '=wildcard, \"text\"=string) · n/N next/prev · {/} magic hits
+      za toggle fold · zR expand all · zM collapse all (Marks tree / Template tab)
+      Triage & Template tabs: J/K move selection · Enter jump / fold
+      / search: ?? wildcard · \"text\" str · i\"text\" caseless · re: regex · v/ scoped
+      n/N next/prev · ↑/↓ history · {/} magic · y yank · p paste · :fill <hex>
       Tab/S-Tab cycle side pane · J/K scroll · >/< resize · # checksum · e entropy";

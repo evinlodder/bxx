@@ -109,18 +109,32 @@ enum Member {
 #[derive(Debug, Clone)]
 struct StructDef {
     members: Vec<Member>,
+    /// Where this definition was loaded from (for the Template pane).
+    source: String,
 }
 
 #[derive(Debug, Clone)]
 struct EnumDef {
     base: RegionType,
     variants: Vec<(String, i64)>,
+    source: String,
 }
 
 #[derive(Debug, Clone)]
 struct BitfieldDef {
     base: RegionType,
     groups: Vec<(String, u32)>, // (name, bit width), LSB first
+    source: String,
+}
+
+/// One definition rendered for the Template side pane (foldable).
+pub struct TemplateEntry {
+    pub source: String,
+    pub name: String,
+    /// e.g. `struct png {` / `enum Kind : u8 {` / `bitfield Perm : u8 {`.
+    pub header: String,
+    /// Body lines (fields/variants/groups) plus the closing `}`.
+    pub body: Vec<String>,
 }
 
 /// A parsed set of templates from one or more `.bxs` files.
@@ -263,9 +277,11 @@ enum Tok {
     Shr,
 }
 
-fn strip_comments(src: &str) -> String {
+/// Strip `//` and `/* */` comments, preserving bytes verbatim (so multi-byte
+/// UTF-8 in the source survives) and keeping newlines for accurate line counts.
+fn strip_comments(src: &str) -> Vec<u8> {
     let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
+    let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
@@ -276,14 +292,14 @@ fn strip_comments(src: &str) -> String {
             i += 2;
             while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
                 if b[i] == b'\n' {
-                    out.push('\n'); // keep line count accurate through block comments
+                    out.push(b'\n');
                 }
                 i += 1;
             }
             i += 2;
-            out.push(' ');
+            out.push(b' ');
         } else {
-            out.push(b[i] as char);
+            out.push(b[i]);
             i += 1;
         }
     }
@@ -291,10 +307,11 @@ fn strip_comments(src: &str) -> String {
 }
 
 /// Tokenize, tracking the 1-based source line of each token (for error
-/// messages). Returns parallel `(tokens, lines)` vectors.
+/// messages). Returns parallel `(tokens, lines)` vectors. Operates on bytes
+/// throughout — the language is ASCII, so any non-ASCII byte is rejected
+/// cleanly rather than panicking on a UTF-8 boundary.
 fn lex(src: &str) -> Result<(Vec<Tok>, Vec<u32>), String> {
-    let s = strip_comments(src);
-    let b = s.as_bytes();
+    let b = strip_comments(src);
     let mut out = Vec::new();
     let mut lines = Vec::new();
     let mut i = 0;
@@ -306,23 +323,22 @@ fn lex(src: &str) -> Result<(Vec<Tok>, Vec<u32>), String> {
             i += 1;
             continue;
         }
-        if (c as char).is_whitespace() {
+        if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
         let at = line;
         // maximal-munch two-character operators
         if i + 1 < b.len() {
-            let two = &s[i..i + 2];
-            let t = match two {
-                "==" => Some(Tok::EqEq),
-                "!=" => Some(Tok::Ne),
-                "<=" => Some(Tok::Le),
-                ">=" => Some(Tok::Ge),
-                "&&" => Some(Tok::AndAnd),
-                "||" => Some(Tok::OrOr),
-                "<<" => Some(Tok::Shl),
-                ">>" => Some(Tok::Shr),
+            let t = match (c, b[i + 1]) {
+                (b'=', b'=') => Some(Tok::EqEq),
+                (b'!', b'=') => Some(Tok::Ne),
+                (b'<', b'=') => Some(Tok::Le),
+                (b'>', b'=') => Some(Tok::Ge),
+                (b'&', b'&') => Some(Tok::AndAnd),
+                (b'|', b'|') => Some(Tok::OrOr),
+                (b'<', b'<') => Some(Tok::Shl),
+                (b'>', b'>') => Some(Tok::Shr),
                 _ => None,
             };
             if let Some(t) = t {
@@ -368,19 +384,22 @@ fn lex(src: &str) -> Result<(Vec<Tok>, Vec<u32>), String> {
             if c == b'0' && i + 1 < b.len() && (b[i + 1] | 0x20) == b'x' {
                 i += 2;
                 let hs = i;
-                while i < b.len() && (b[i] as char).is_ascii_hexdigit() {
+                while i < b.len() && b[i].is_ascii_hexdigit() {
                     i += 1;
                 }
-                let v = i64::from_str_radix(&s[hs..i], 16)
-                    .map_err(|_| format!("line {at}: bad hex number '{}'", &s[start..i]))?;
+                // bytes here are all ASCII hex digits → valid UTF-8.
+                let digits = std::str::from_utf8(&b[hs..i]).unwrap_or("");
+                let v = i64::from_str_radix(digits, 16)
+                    .map_err(|_| format!("line {at}: bad hex number '0x{digits}'"))?;
                 out.push(Tok::Num(v));
             } else {
                 while i < b.len() && b[i].is_ascii_digit() {
                     i += 1;
                 }
-                let v: i64 = s[start..i]
+                let digits = std::str::from_utf8(&b[start..i]).unwrap_or("");
+                let v: i64 = digits
                     .parse()
-                    .map_err(|_| format!("line {at}: bad number '{}'", &s[start..i]))?;
+                    .map_err(|_| format!("line {at}: bad number '{digits}'"))?;
                 out.push(Tok::Num(v));
             }
             lines.push(at);
@@ -391,11 +410,13 @@ fn lex(src: &str) -> Result<(Vec<Tok>, Vec<u32>), String> {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
-            out.push(Tok::Ident(s[start..i].to_string()));
+            // identifier bytes are ASCII [A-Za-z0-9_] → valid UTF-8.
+            let name = std::str::from_utf8(&b[start..i]).unwrap_or("").to_string();
+            out.push(Tok::Ident(name));
             lines.push(at);
             continue;
         }
-        return Err(format!("line {at}: unexpected character '{}'", c as char));
+        return Err(format!("line {at}: unexpected byte 0x{c:02x}"));
     }
     Ok((out, lines))
 }
@@ -497,7 +518,13 @@ impl Parser {
         let name = self.ident()?;
         self.eat(&Tok::LBrace)?;
         let members = self.parse_members()?;
-        Ok((name, StructDef { members }))
+        Ok((
+            name,
+            StructDef {
+                members,
+                source: String::new(),
+            },
+        ))
     }
 
     /// Parse members up to and including the closing `}`.
@@ -593,7 +620,14 @@ impl Parser {
         if variants.is_empty() {
             return Err(self.e(format!("enum {name} has no variants")));
         }
-        Ok((name, EnumDef { base, variants }))
+        Ok((
+            name,
+            EnumDef {
+                base,
+                variants,
+                source: String::new(),
+            },
+        ))
     }
 
     fn parse_bitfield(&mut self) -> Result<(String, BitfieldDef), String> {
@@ -632,7 +666,14 @@ impl Parser {
         if groups.is_empty() {
             return Err(self.e(format!("bitfield {name} has no groups")));
         }
-        Ok((name, BitfieldDef { base, groups }))
+        Ok((
+            name,
+            BitfieldDef {
+                base,
+                groups,
+                source: String::new(),
+            },
+        ))
     }
 
     /// Parse a type name that must be an integer scalar (enum/bitfield base).
@@ -744,25 +785,28 @@ impl Ctx<'_> {
         if self.stop {
             return;
         }
-        if self.off + size > self.buf.len() {
-            self.warn = Some(format!("'{label}' overruns end of file at 0x{:X}", self.off));
-            self.stop = true;
-            return;
-        }
+        // checked_add guards against attacker-controlled sizes wrapping u64.
+        let end = match self.off.checked_add(size) {
+            Some(e) if e <= self.buf.len() => e,
+            _ => {
+                self.warn = Some(format!("'{label}' overruns end of file at 0x{:X}", self.off));
+                self.stop = true;
+                return;
+            }
+        };
         if self.regions.len() >= MAX_REGIONS {
             self.warn = Some(format!("stopped at {MAX_REGIONS} fields (cap)"));
             self.stop = true;
             return;
         }
-        let start = self.off;
         self.regions.push(Region {
-            start,
-            end: start + size,
+            start: self.off,
+            end,
             label,
             rtype,
             note,
         });
-        self.off += size;
+        self.off = end;
     }
 }
 
@@ -786,42 +830,65 @@ impl Template {
         self.bitfields.extend(other.bitfields);
     }
 
-    /// Render the loaded definitions back to source-like text (for the
-    /// Template side tab). Header lines start in column 0, body lines indented.
-    pub fn describe(&self) -> Vec<String> {
+    /// Tag every definition with the source it came from (file path or label).
+    pub fn set_source(&mut self, src: &str) {
+        for d in self.structs.values_mut() {
+            d.source = src.to_string();
+        }
+        for d in self.enums.values_mut() {
+            d.source = src.to_string();
+        }
+        for d in self.bitfields.values_mut() {
+            d.source = src.to_string();
+        }
+    }
+
+    /// All definitions as foldable entries for the Template side tab, sorted
+    /// by source then name (so same-source entries group together).
+    pub fn entries(&self) -> Vec<TemplateEntry> {
         let mut out = Vec::new();
-        let mut snames: Vec<&String> = self.structs.keys().collect();
-        snames.sort();
-        for name in snames {
-            out.push(format!("struct {name} {{"));
-            for m in &self.structs[name].members {
-                describe_member(m, 1, &mut out);
+        for (name, d) in &self.structs {
+            let mut body = Vec::new();
+            for m in &d.members {
+                describe_member(m, 1, &mut body);
             }
-            out.push("}".into());
-            out.push(String::new());
+            body.push("}".into());
+            out.push(TemplateEntry {
+                source: group_key(&d.source),
+                name: name.clone(),
+                header: format!("struct {name} {{"),
+                body,
+            });
         }
-        let mut enames: Vec<&String> = self.enums.keys().collect();
-        enames.sort();
-        for name in enames {
-            let e = &self.enums[name];
-            out.push(format!("enum {name} : {} {{", e.base));
-            for (vn, v) in &e.variants {
-                out.push(format!("    {vn} = {v},"));
-            }
-            out.push("}".into());
-            out.push(String::new());
+        for (name, e) in &self.enums {
+            let mut body: Vec<String> = e
+                .variants
+                .iter()
+                .map(|(vn, v)| format!("    {vn} = {v},"))
+                .collect();
+            body.push("}".into());
+            out.push(TemplateEntry {
+                source: group_key(&e.source),
+                name: name.clone(),
+                header: format!("enum {name} : {} {{", e.base),
+                body,
+            });
         }
-        let mut bnames: Vec<&String> = self.bitfields.keys().collect();
-        bnames.sort();
-        for name in bnames {
-            let b = &self.bitfields[name];
-            out.push(format!("bitfield {name} : {} {{", b.base));
-            for (gn, bits) in &b.groups {
-                out.push(format!("    {gn} : {bits},"));
-            }
-            out.push("}".into());
-            out.push(String::new());
+        for (name, b) in &self.bitfields {
+            let mut body: Vec<String> = b
+                .groups
+                .iter()
+                .map(|(gn, bits)| format!("    {gn} : {bits},"))
+                .collect();
+            body.push("}".into());
+            out.push(TemplateEntry {
+                source: group_key(&b.source),
+                name: name.clone(),
+                header: format!("bitfield {name} : {} {{", b.base),
+                body,
+            });
         }
+        out.sort_by(|a, b| a.source.cmp(&b.source).then(a.name.cmp(&b.name)));
         out
     }
 
@@ -1012,6 +1079,14 @@ impl Template {
         });
         ctx.emit(size, label, def.base, note);
         raw.map(|x| x as i64)
+    }
+}
+
+fn group_key(src: &str) -> String {
+    if src.is_empty() {
+        "(unspecified)".to_string()
+    } else {
+        src.to_string()
     }
 }
 
