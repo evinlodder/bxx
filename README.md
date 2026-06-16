@@ -1,5 +1,9 @@
 # bxx
 
+[![Crates.io](https://img.shields.io/crates/v/bxx.svg)](https://crates.io/crates/bxx)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![License: APACHE](https://img.shields.io/badge/license-APACHE-blue.svg)](LICENSE-APACHE)
+
 A fast terminal hex editor and reverse-engineering workbench. `bxx` pairs a
 vim-style hex/ASCII viewer-editor with the things you actually need to take a
 binary apart:
