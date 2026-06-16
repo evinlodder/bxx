@@ -73,15 +73,29 @@ pub fn parse_hex_pattern(input: &str) -> Result<Vec<Pat>, String> {
     Ok(pats)
 }
 
-/// Search query: `/de ad ?? ef` = hex pattern, `/"text"` = string search
-/// (matches both ASCII and UTF-16LE encodings of the text).
+/// Search query:
+/// - `de ad ?? ef` — hex pattern with `??` wildcards
+/// - `"text"` — string (ASCII **and** UTF-16LE), case-sensitive
+/// - `i"text"` — case-insensitive ASCII string
+/// - `re:pattern` — regex over bytes (requires the `regex` build feature)
 pub fn run_search(buf: &FileBuffer, input: &str) -> Result<SearchState, String> {
     let input = input.trim();
     let mut state = SearchState {
         query: input.to_string(),
         ..Default::default()
     };
-    if let Some(text) = input.strip_prefix('"') {
+    if let Some(rest) = input.strip_prefix("re:") {
+        state.hits = find_regex(buf, rest)?;
+    } else if let Some(text) = input
+        .strip_prefix('i')
+        .and_then(|r| r.strip_prefix('"'))
+    {
+        let text = text.strip_suffix('"').unwrap_or(text);
+        if text.is_empty() {
+            return Err("empty string query".into());
+        }
+        state.hits = find_string_ci(buf, text);
+    } else if let Some(text) = input.strip_prefix('"') {
         let text = text.strip_suffix('"').unwrap_or(text);
         if text.is_empty() {
             return Err("empty string query".into());
@@ -104,6 +118,54 @@ pub fn run_search(buf: &FileBuffer, input: &str) -> Result<SearchState, String> 
     Ok(state)
 }
 
+/// Case-insensitive ASCII string search (overlay-aware).
+fn find_string_ci(buf: &FileBuffer, text: &str) -> Vec<(u64, u64)> {
+    let needle: Vec<u8> = text.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    let n = needle.len();
+    let raw = buf.raw();
+    let len = raw.len();
+    if n == 0 || len < n {
+        return Vec::new();
+    }
+    let dirty = buf.has_unsaved_changes();
+    let mut hits = Vec::new();
+    for start in 0..=(len - n) {
+        let ok = needle.iter().enumerate().all(|(i, &nb)| {
+            let b = if dirty {
+                buf.get((start + i) as u64).unwrap_or(0)
+            } else {
+                raw[start + i]
+            };
+            b.to_ascii_lowercase() == nb
+        });
+        if ok {
+            hits.push((start as u64, (start + n) as u64));
+        }
+    }
+    hits
+}
+
+#[cfg(feature = "regex")]
+fn find_regex(buf: &FileBuffer, pattern: &str) -> Result<Vec<(u64, u64)>, String> {
+    let re = regex::bytes::Regex::new(pattern).map_err(|e| format!("regex: {e}"))?;
+    let owned;
+    let data: &[u8] = if buf.has_unsaved_changes() {
+        owned = buf.get_range(0, buf.len() as usize);
+        &owned
+    } else {
+        buf.raw()
+    };
+    Ok(re
+        .find_iter(data)
+        .map(|m| (m.start() as u64, m.end() as u64))
+        .collect())
+}
+
+#[cfg(not(feature = "regex"))]
+fn find_regex(_buf: &FileBuffer, _pattern: &str) -> Result<Vec<(u64, u64)>, String> {
+    Err("regex search not built in (rebuild with --features regex)".into())
+}
+
 /// Find every occurrence of a concrete byte sequence (overlay-aware). Used for
 /// cross-reference scans (e.g. "find pointers equal to this offset").
 pub fn find_bytes(buf: &FileBuffer, needle: &[u8]) -> Vec<(u64, u64)> {
@@ -114,39 +176,69 @@ pub fn find_bytes(buf: &FileBuffer, needle: &[u8]) -> Vec<(u64, u64)> {
     find_all(buf.raw(), buf, &pats)
 }
 
-/// Scan with overlay applied. The raw mmap slice is the fast path; overlay
-/// bytes are patched into a window copy only around edited offsets — but since
-/// overlays are sparse and scans must see edits, we simply re-check candidate
-/// windows through the buffer when any overlay exists.
+/// Scan for every match of `pat`, overlay-aware.
+///
+/// Uses Boyer-Moore-Horspool with a bad-character skip table so it advances
+/// several bytes per step instead of one. Wildcards are handled by aligning on
+/// the pattern's concrete tail: trailing `??` are stripped (and re-added to the
+/// match length), and the skip table only trusts the run of concrete bytes
+/// after the last interior wildcard — so we never skip past a possible match.
 fn find_all(raw: &[u8], buf: &FileBuffer, pat: &[Pat]) -> Vec<(u64, u64)> {
     let n = pat.len();
-    if raw.len() < n {
+    let len = raw.len();
+    if n == 0 || len < n {
         return Vec::new();
     }
     let dirty = buf.has_unsaved_changes();
+    // Reading a byte through the overlay only when there are unsaved edits.
+    let at = |i: usize| -> u8 {
+        if dirty {
+            buf.get(i as u64).unwrap_or(0)
+        } else {
+            raw[i]
+        }
+    };
+
+    // Strip trailing wildcards: they always match, so search the concrete-ended
+    // core and extend each hit by `trail` bytes.
+    let trail = pat.iter().rev().take_while(|p| matches!(p, Pat::Any)).count();
+    let core = &pat[..n - trail];
+    let m = core.len();
     let mut hits = Vec::new();
-    // First concrete byte for a cheap skip-scan.
-    let anchor = pat.iter().position(|p| matches!(p, Pat::Byte(_)));
-    'outer: for start in 0..=(raw.len() - n) {
-        if let Some(a) = anchor
-            && !dirty
-            && let Pat::Byte(b) = pat[a]
-            && raw[start + a] != b
-        {
-            continue;
+
+    // Degenerate: pattern is all wildcards — every aligned window matches.
+    if m == 0 {
+        for start in 0..=(len - n) {
+            hits.push((start as u64, (start + n) as u64));
         }
-        for (i, p) in pat.iter().enumerate() {
-            let actual = if dirty {
-                buf.get((start + i) as u64).unwrap()
-            } else {
-                raw[start + i]
-            };
-            match p {
-                Pat::Byte(b) if *b != actual => continue 'outer,
-                _ => {}
-            }
+        return hits;
+    }
+
+    // Build the skip table over the trusted concrete suffix of `core`.
+    let last_wild = core.iter().rposition(|p| matches!(p, Pat::Any));
+    let suffix_lo = last_wild.map(|w| w + 1).unwrap_or(0);
+    let safe = (m - suffix_lo) as u32; // max safe shift (length of concrete tail)
+    let mut skip = [safe; 256];
+    for (j, p) in core.iter().enumerate().take(m - 1).skip(suffix_lo) {
+        if let Pat::Byte(b) = p {
+            skip[*b as usize] = (m - 1 - j) as u32;
         }
-        hits.push((start as u64, (start + n) as u64));
+    }
+
+    let matches_at = |start: usize| -> bool {
+        core.iter().enumerate().all(|(i, p)| match p {
+            Pat::Byte(b) => *b == at(start + i),
+            Pat::Any => true,
+        })
+    };
+
+    let mut start = 0usize;
+    while start + m <= len {
+        if matches_at(start) && start + n <= len {
+            hits.push((start as u64, (start + n) as u64));
+        }
+        let c = at(start + m - 1);
+        start += skip[c as usize].max(1) as usize;
     }
     hits
 }
@@ -226,5 +318,102 @@ mod tests {
         assert_eq!(s.prev(2), Some((8, 9))); // wrap back
         assert!(s.hit_at(8));
         assert!(!s.hit_at(9));
+    }
+
+    #[test]
+    fn case_insensitive_string() {
+        let buf = fixture(b"xxABCyyabcZZAbC", "ci");
+        let s = run_search(&buf, "i\"abc\"").unwrap();
+        assert_eq!(s.hits, vec![(2, 5), (7, 10), (12, 15)]);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn regex_search_when_enabled() {
+        let buf = fixture(b"a12b345c", "re");
+        let s = run_search(&buf, "re:[0-9]+").unwrap();
+        assert_eq!(s.hits, vec![(1, 3), (4, 7)]);
+    }
+
+    #[cfg(not(feature = "regex"))]
+    #[test]
+    fn regex_errors_when_disabled() {
+        let buf = fixture(b"abc", "nore");
+        assert!(run_search(&buf, "re:abc").unwrap_err().contains("regex"));
+    }
+
+    #[test]
+    fn finds_overlapping_matches() {
+        let buf = fixture(b"aaaa", "overlap");
+        let s = run_search(&buf, "61 61").unwrap(); // "aa"
+        assert_eq!(s.hits, vec![(0, 2), (1, 3), (2, 4)]);
+    }
+
+    #[test]
+    fn trailing_and_leading_wildcards() {
+        let buf = fixture(&[0xAB, 0x01, 0x02, 0xAB, 0x99, 0x02], "tlw");
+        // trailing wildcard: "ab ??" matches at 0 and 3
+        assert_eq!(run_search(&buf, "ab ??").unwrap().hits, vec![(0, 2), (3, 5)]);
+        // leading wildcard: "?? 02" matches at (1,3) and (4,6)
+        assert_eq!(run_search(&buf, "?? 02").unwrap().hits, vec![(1, 3), (4, 6)]);
+    }
+
+    /// Brute-force reference, to cross-check Horspool on random data.
+    fn brute(data: &[u8], pat: &[Pat]) -> Vec<(u64, u64)> {
+        let n = pat.len();
+        let mut hits = Vec::new();
+        if n == 0 || data.len() < n {
+            return hits;
+        }
+        for start in 0..=(data.len() - n) {
+            let ok = pat.iter().enumerate().all(|(i, p)| match p {
+                Pat::Byte(b) => *b == data[start + i],
+                Pat::Any => true,
+            });
+            if ok {
+                hits.push((start as u64, (start + n) as u64));
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn horspool_matches_brute_force_random() {
+        // deterministic LCG so the test is reproducible
+        let mut state = 0x1234_5678u64;
+        let mut rng = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        // small alphabet so matches actually occur
+        let data: Vec<u8> = (0..4096).map(|_| rng() % 5).collect();
+        let buf = fixture(&data, "rand");
+
+        let patterns = [
+            "00", "01 02", "02 02 02", "?? 01", "03 ?? 03", "01 02 ??", "?? ?? 04",
+            "04 04 04 04", "00 ?? 00 ?? 00",
+        ];
+        for p in patterns {
+            let pat = parse_hex_pattern(p).unwrap();
+            let got = run_search(&buf, p).unwrap().hits;
+            assert_eq!(got, brute(&data, &pat), "pattern {p}");
+        }
+    }
+
+    // `cargo test --release -- --ignored --nocapture bench_large_search`
+    #[test]
+    #[ignore]
+    fn bench_large_search() {
+        let n = 256 * 1024 * 1024;
+        let mut data = vec![0u8; n];
+        for i in (0..n).step_by(4096) {
+            data[i] = 0xAB; // some anchor noise to defeat trivial skips
+        }
+        data[n - 8..].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+        let buf = fixture(&data, "bench");
+        let t = std::time::Instant::now();
+        let s = run_search(&buf, "de ad be ef ?? fe ba be").unwrap();
+        eprintln!("256MB search: {:?}, {} hit(s)", t.elapsed(), s.hits.len());
+        assert_eq!(s.hits, vec![((n - 8) as u64, n as u64)]);
     }
 }

@@ -38,7 +38,10 @@ impl FileBuffer {
         let mmap = if len == 0 {
             None
         } else {
-            // SAFETY: we open the file read-only and never resize it while mapped.
+            // SAFETY: the file is opened read-only and bxx never resizes it
+            // while mapped. (Concurrent external truncation by another process
+            // could still raise SIGBUS — an inherent mmap limitation, noted in
+            // the README's Security section; it is not exploitable for UB.)
             Some(unsafe { Mmap::map(&file)? })
         };
         Ok(Self {
@@ -187,6 +190,8 @@ impl FileBuffer {
                 // Remap so raw() reflects what's on disk, then the overlay is empty.
                 let file = File::open(&self.path)?;
                 if !self.is_empty() {
+                    // SAFETY: same invariant as in `open` — read-only mapping,
+                    // not resized by bxx while mapped.
                     self.mmap = Some(unsafe { Mmap::map(&file)? });
                 }
                 self.overlay.clear();

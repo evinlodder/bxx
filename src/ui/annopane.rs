@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use crate::analysis::{entropy, strings};
+use crate::analysis::{entropy, strings, triage};
 use crate::app::{App, SideTab};
 use crate::inspector;
 
@@ -15,99 +15,417 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let titles = ["Marks", "Inspect", "Strings", "Analysis", "Entropy", "Output"];
-    let selected = match app.side_tab {
-        SideTab::Marks => 0,
-        SideTab::Inspect => 1,
-        SideTab::Strings => 2,
-        SideTab::Analysis => 3,
-        SideTab::Entropy => 4,
-        SideTab::Output => 5,
-    };
-    // Tabs wrap onto as many rows as the pane width needs.
-    let tab_rows = tab_lines(&titles, selected, inner.width);
-    let tab_height = tab_rows.len() as u16;
+    let titles: Vec<&str> = SideTab::ORDER.iter().map(|t| tab_title(*t)).collect();
+    let selected = SideTab::ORDER
+        .iter()
+        .position(|&t| t == app.side_tab)
+        .unwrap_or(0);
+    // Single-row carousel: scrolls to keep the active tab centred, with </>
+    // edge hints when more tabs exist off-screen.
     let [tab_area, body] =
-        Layout::vertical([Constraint::Length(tab_height), Constraint::Min(0)]).areas(inner);
-    frame.render_widget(Paragraph::new(tab_rows), tab_area);
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(tab_header_line(&titles, selected, inner.width)),
+        tab_area,
+    );
 
-    // The Strings list is pre-windowed for speed, so it manages its own scroll.
-    let (lines, scroll): (Vec<Line>, u16) = match app.side_tab {
-        SideTab::Marks => (marks_lines(app), app.side_scroll),
-        SideTab::Inspect => (inspect_lines(app), app.side_scroll),
-        SideTab::Strings => (strings_lines(app, body), 0),
+    // Marks and Strings are pre-windowed for speed, so they manage their own
+    // scroll; the rest use the shared scroll offset with wrapping.
+    let (lines, scroll, wrap): (Vec<Line>, u16, bool) = match app.side_tab {
+        SideTab::Marks => (marks_lines(app, body), 0, false),
+        SideTab::Template => (template_lines(app, body), 0, false),
+        SideTab::Inspect => (inspect_lines(app), app.side_scroll, true),
+        SideTab::Strings => (strings_lines(app, body), 0, false),
+        SideTab::Triage => (triage_lines(app, body), 0, false),
+        SideTab::Transform => (transform_lines(app, body), app.side_scroll, true),
         SideTab::Analysis => (
             app.info_lines().into_iter().map(Line::from).collect(),
             app.side_scroll,
+            true,
         ),
-        SideTab::Entropy => (entropy_lines(app, body), app.side_scroll),
+        SideTab::Entropy => (entropy_lines(app, body), app.side_scroll, false),
         SideTab::Output => (
             app.output_lines.iter().cloned().map(Line::from).collect(),
             app.side_scroll,
+            true,
         ),
     };
-    frame.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).wrap(Wrap { trim: false }),
-        body,
-    );
+    let para = Paragraph::new(lines).scroll((scroll, 0));
+    let para = if wrap { para.wrap(Wrap { trim: false }) } else { para };
+    frame.render_widget(para, body);
 }
 
-/// Lay tab labels across as many rows as `width` requires (poor-man's wrap,
-/// since ratatui's `Tabs` is single-line).
-fn tab_lines(titles: &[&str], selected: usize, width: u16) -> Vec<Line<'static>> {
-    let width = width.max(1) as usize;
-    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut row_w = 0usize;
+fn tab_title(t: SideTab) -> &'static str {
+    match t {
+        SideTab::Marks => "Marks",
+        SideTab::Template => "Template",
+        SideTab::Inspect => "Inspect",
+        SideTab::Strings => "Strings",
+        SideTab::Triage => "Triage",
+        SideTab::Transform => "Transform",
+        SideTab::Analysis => "Analysis",
+        SideTab::Entropy => "Entropy",
+        SideTab::Output => "Output",
+    }
+}
+
+/// A single-row tab strip that scrolls to keep the selected tab centred,
+/// clamped at both ends (no wrap-around), with `<`/`>` edge indicators.
+fn tab_header_line(titles: &[&str], selected: usize, width: u16) -> Line<'static> {
+    let dim = Style::default().fg(Color::Gray);
+    let hot = Style::default()
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let arrow = Style::default().fg(Color::Yellow);
+
+    // Flatten the whole strip into styled characters, tracking the selection.
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    let (mut sel_start, mut sel_len) = (0usize, 0usize);
     for (i, t) in titles.iter().enumerate() {
         let label = format!(" {t} ");
-        let w = label.chars().count();
-        if row_w > 0 && row_w + w > width {
-            rows.push(Vec::new());
-            row_w = 0;
+        if i == selected {
+            sel_start = chars.len();
+            sel_len = label.chars().count();
         }
-        let style = if i == selected {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        rows.last_mut().unwrap().push(Span::styled(label, style));
-        row_w += w;
+        let style = if i == selected { hot } else { dim };
+        for c in label.chars() {
+            chars.push((c, style));
+        }
     }
-    rows.into_iter().map(Line::from).collect()
+
+    let total = chars.len();
+    let content_w = (width as usize).saturating_sub(2).max(1); // edges hold arrows
+    let scroll = if total <= content_w {
+        0
+    } else {
+        let center = sel_start + sel_len / 2;
+        center
+            .saturating_sub(content_w / 2)
+            .min(total - content_w)
+    };
+    let left = scroll > 0;
+    let right = scroll + content_w < total;
+
+    let mut spans = vec![Span::styled(if left { "<" } else { " " }.to_string(), arrow)];
+    for &(c, st) in chars.iter().skip(scroll).take(content_w) {
+        spans.push(Span::styled(c.to_string(), st));
+    }
+    spans.push(Span::styled(if right { ">" } else { " " }.to_string(), arrow));
+    Line::from(spans)
 }
 
-fn marks_lines(app: &App) -> Vec<Line<'static>> {
-    if app.annotations.is_empty() {
+fn triage_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    let Some(rep) = &app.triage else {
         return vec![
-            Line::from("no annotations"),
+            Line::from("not a recognized executable"),
             Line::from(""),
-            Line::from(":mark <start> <end> <label> <type>"),
-            Line::from("or select with v then press m"),
+            Line::from("works on ELF — :triage to (re)scan"),
         ];
-    }
-    let mut lines = Vec::new();
-    for r in &app.annotations {
-        let here = r.contains(app.cursor);
-        let head_style = if here {
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut sel_line = 0usize;
+
+    rows.push(Line::from(vec![
+        Span::styled(
+            rep.format.clone(),
+            Style::default()
+                .fg(app.config.color_annotation)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ({} items · J/K select · ⏎ jump)", rep.entries.len()),
+            dim,
+        ),
+    ]));
+
+    let mut last_kind: Option<triage::Kind> = None;
+    for (i, e) in rep.entries.iter().enumerate() {
+        if Some(e.kind) != last_kind {
+            rows.push(Line::from(Span::styled(
+                e.kind.label(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            last_kind = Some(e.kind);
+        }
+        let selected = i == app.triage_sel;
+        if selected {
+            sel_line = rows.len();
+        }
+        let name_style = if selected {
             Style::default()
                 .fg(app.config.color_annotation)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::default().fg(app.config.color_annotation)
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", r.label), head_style),
-            Span::styled(
-                format!("{} 0x{:X}..0x{:X}", r.rtype, r.start, r.end),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        lines.push(Line::from(format!("  = {}", r.decode(&app.buf))));
+        let mut spans = vec![
+            Span::styled(if selected { "▸ " } else { "  " }.to_string(), dim),
+            Span::styled(e.name.clone(), name_style),
+        ];
+        if !e.detail.is_empty() {
+            spans.push(Span::styled(format!("  {}", e.detail), dim));
+        }
+        if let Some(a) = e.addr {
+            spans.push(Span::styled(format!("  @0x{a:X}"), Style::default().fg(Color::Cyan)));
+        }
+        if let Some(o) = e.offset {
+            spans.push(Span::styled(format!("  off 0x{o:X}"), dim));
+        }
+        if e.size > 0 {
+            spans.push(Span::styled(format!("  {}B", e.size), dim));
+        }
+        rows.push(Line::from(spans));
     }
-    lines
+
+    // window so the selected row stays on screen
+    let height = (body.height as usize).max(1);
+    let max_start = rows.len().saturating_sub(height);
+    let start = sel_line.saturating_sub(height / 2).min(max_start);
+    rows.into_iter().skip(start).take(height).collect()
+}
+
+fn transform_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    let Some((s, e)) = app.tx_input else {
+        return vec![
+            Line::from("no transform input"),
+            Line::from(""),
+            Line::from("select bytes (v), press T — or :transform"),
+            Line::from("then :t <op> (e.g. :t unbase64, :t xor 5a)"),
+            Line::from(":pipelines lists named recipes (~/.bxpipes)"),
+        ];
+    };
+    let mut out = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
+    out.push(Line::from(vec![
+        Span::styled("input ", dim),
+        Span::styled(
+            format!("0x{s:X}..0x{e:X} ({} B)", e - s),
+            Style::default().fg(app.config.color_annotation),
+        ),
+    ]));
+
+    out.push(Line::from(Span::styled("recipe:", dim)));
+    if app.tx_recipe.is_empty() {
+        out.push(Line::from(Span::styled("  (empty — :t <op> to add)", dim)));
+    } else {
+        for (i, op) in app.tx_recipe.iter().enumerate() {
+            out.push(Line::from(vec![
+                Span::styled(format!("  {}. ", i + 1), dim),
+                Span::styled(
+                    op.clone(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+    }
+    out.push(Line::from(""));
+
+    match &app.tx_output {
+        Some(Ok(bytes)) => {
+            out.push(Line::from(Span::styled(
+                format!("output: {} byte(s)", bytes.len()),
+                Style::default().fg(Color::Green),
+            )));
+            // hex preview, sized to the pane
+            let cols = ((body.width as usize).saturating_sub(2) / 4).clamp(4, 16);
+            let rows = (body.height as usize).saturating_sub(out.len() + 2).max(2);
+            for chunk in bytes.chunks(cols).take(rows) {
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '·' })
+                    .collect();
+                out.push(Line::from(vec![
+                    Span::raw(format!("{:<width$} ", hex.join(" "), width = cols * 3)),
+                    Span::styled(ascii, dim),
+                ]));
+            }
+            if bytes.len() > cols * rows {
+                out.push(Line::from(Span::styled("  …", dim)));
+            }
+            // text rendering, if it looks textual
+            let printable = bytes
+                .iter()
+                .filter(|&&b| (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\t')
+                .count();
+            if !bytes.is_empty() && printable * 100 / bytes.len() >= 90 {
+                out.push(Line::from(Span::styled("── as text ──", dim)));
+                let text: String = bytes
+                    .iter()
+                    .take(2048)
+                    .map(|&b| if b == b'\n' { ' ' } else { b as char })
+                    .collect();
+                out.push(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        Some(Err(msg)) => out.push(Line::from(Span::styled(
+            format!("error: {msg}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))),
+        None => out.push(Line::from(Span::styled("(no output)", dim))),
+    }
+    out
+}
+
+fn template_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    let entries = app.template.entries();
+    if entries.is_empty() {
+        return vec![
+            Line::from("no templates loaded"),
+            Line::from(""),
+            Line::from("built-ins ship in; auto-loads <file>.bxs,"),
+            Line::from("or :loadstructs <file|dir>"),
+            Line::from("then :applystruct <name> at the cursor"),
+        ];
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let sel_style = |base: Style, selected: bool| {
+        if selected {
+            base.add_modifier(Modifier::REVERSED)
+        } else {
+            base
+        }
+    };
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut node = 0usize; // index among visible foldable nodes
+    let mut sel_row = 0usize;
+    let mut last_source: Option<String> = None;
+
+    for e in &entries {
+        if last_source.as_deref() != Some(e.source.as_str()) {
+            let collapsed = app.template_collapsed.contains(&e.source);
+            let selected = node == app.template_sel;
+            if selected {
+                sel_row = rows.len();
+            }
+            let glyph = if collapsed { "▸" } else { "▾" };
+            rows.push(Line::from(vec![Span::styled(
+                format!("{glyph} ── {} ──", e.source),
+                sel_style(
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    selected,
+                ),
+            )]));
+            node += 1;
+            last_source = Some(e.source.clone());
+        }
+        if app.template_collapsed.contains(&e.source) {
+            continue; // source folded → hide its definitions
+        }
+        let key = format!("{}\0{}", e.source, e.name);
+        let collapsed = app.template_collapsed.contains(&key);
+        let selected = node == app.template_sel;
+        if selected {
+            sel_row = rows.len();
+        }
+        let glyph = if collapsed { "▸" } else { "▾" };
+        let head_style = sel_style(
+            Style::default()
+                .fg(app.config.color_annotation)
+                .add_modifier(Modifier::BOLD),
+            selected,
+        );
+        if collapsed {
+            // one-liner: `▸ struct png { … }`
+            rows.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), dim),
+                Span::styled(format!("{} … }}", e.header), head_style),
+            ]));
+        } else {
+            rows.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), dim),
+                Span::styled(e.header.clone(), head_style),
+            ]));
+            for b in &e.body {
+                rows.push(Line::from(Span::styled(format!("    {b}"), dim)));
+            }
+        }
+        node += 1;
+    }
+
+    // window so the selected node stays on screen
+    let height = (body.height as usize).max(1);
+    let max_start = rows.len().saturating_sub(height);
+    let start = sel_row.saturating_sub(height / 2).min(max_start);
+    rows.into_iter().skip(start).take(height).collect()
+}
+
+fn marks_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    if app.annotations.is_empty() {
+        return vec![
+            Line::from("no annotations"),
+            Line::from(""),
+            Line::from(":mark <start> <end> <label> <type>"),
+            Line::from("or select with v then press m"),
+            Line::from(":applystruct <name> to parse a struct"),
+        ];
+    }
+    let forest = crate::marks::build(&app.annotations);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    render_nodes(&forest, 0, app, &mut rows);
+
+    // Window the (possibly long, when expanded) list to what fits.
+    let height = (body.height as usize).max(1);
+    let start = (app.side_scroll as usize).min(rows.len().saturating_sub(1));
+    rows.into_iter().skip(start).take(height).collect()
+}
+
+fn render_nodes(
+    level: &[crate::marks::MarkNode],
+    depth: usize,
+    app: &App,
+    out: &mut Vec<Line<'static>>,
+) {
+    let indent = "  ".repeat(depth);
+    for n in level {
+        let here = app.cursor >= n.start && app.cursor < n.end;
+        if n.is_group() {
+            let collapsed = app.collapsed.contains(&n.path);
+            // Highlight a collapsed group that holds the cursor (deepest visible).
+            let hl = here && collapsed;
+            let glyph = if collapsed { "▸" } else { "▾" };
+            let name_style = base_style(app, hl);
+            out.push(Line::from(vec![
+                Span::styled(format!("{indent}{glyph} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} ", n.name), name_style),
+                Span::styled(n.summary(), Style::default().fg(Color::DarkGray)),
+            ]));
+            if !collapsed {
+                render_nodes(&n.children, depth + 1, app, out);
+            }
+        } else if let Some(ri) = n.region {
+            let r = &app.annotations[ri];
+            let mut spans = vec![
+                Span::styled(format!("{indent}  "), Style::default()),
+                Span::styled(format!("{} ", n.name), base_style(app, here)),
+                Span::raw(format!("= {}", r.decode(&app.buf))),
+            ];
+            if let Some(note) = &r.note {
+                spans.push(Span::styled(
+                    format!("  {note}"),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ));
+            }
+            out.push(Line::from(spans));
+        }
+    }
+}
+
+fn base_style(app: &App, highlight: bool) -> Style {
+    let s = Style::default().fg(app.config.color_annotation);
+    if highlight {
+        s.add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        s
+    }
 }
 
 fn inspect_lines(app: &App) -> Vec<Line<'static>> {

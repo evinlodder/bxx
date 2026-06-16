@@ -1,4 +1,4 @@
-Build a terminal binary analysis tool in Rust called "bx".
+Build a terminal binary analysis tool in Rust called "bxx".
 
 UI & Layout:
 - ratatui + crossterm TUI with a configurable pane layout:
@@ -117,7 +117,7 @@ Milestone A — 010-parity features:
   hex/oct/bin/ASCII. `inspector.rs`.
 - **Multiple files** (tabs): `App` owns `Vec<Document>` and derefs to the
   active one (per-file: buf, annotations, search, analysis, cursor, etc.).
-  `bx a b c` opens tabs; `gt`/`gT`, `:e`, `:bn`/`:bp`/`:b<n>`, `:ls`,
+  `bxx a b c` opens tabs; `gt`/`gT`, `:e`, `:bn`/`:bp`/`:b<n>`, `:ls`,
   `:close`; `:q` closes active then quits on last; `:qa`. `--diff` flag
   preserves the old side-by-side diff. Tab strip across the top.
 
@@ -137,16 +137,133 @@ Milestone B — navigation & xrefs:
 - **Side-tab strip wraps** to multiple rows when too narrow (manual layout;
   ratatui `Tabs` is single-line).
 
-# Roadmap (next thrusts, in recommended order)
+Milestone C — template/struct language v2 (`structs.rs`, the `Template` engine):
+- Replaced the flat `.bxs` parser with a small C-like language (lexer + Pratt
+  expression parser + buffer-aware apply). Backward compatible with flat structs.
+- **Nested structs**, **dynamic arrays** sized by earlier fields with full
+  expressions, **enums** (`enum K : u8 { A=1 }` → field shows variant name),
+  **bitfields** (`bitfield F : u8 { a:1, b:7 }` → LSB-first group breakdown),
+  **`if/else` conditionals**. Operators: + - * / % == != < <= > >= && || & | ^ ~ << >>.
+- `Region` gained an optional `note` field (enum/bitfield decode hint), shown
+  in the Marks tab and JSON export, persisted in `.bxa` (serde default).
+- `:applystruct` walks real bytes; emits nested labels (`Hdr.entries[0].name`),
+  warns on EOF overrun / cap (MAX_REGIONS=8192, MAX_DEPTH=64) but keeps partial.
+- Deliberately NOT included (keep it simple): loops, local vars, typedefs,
+  FSeek/scripting, parent-scope access. Arrays cover repetition.
 
-1. **Template/struct language v2** — the core "beat 010/ImHex" lever. Nested
-   structs, arrays sized by earlier fields, enums, bitfields, conditionals,
-   pointers. Pure logic, no heavy deps. (Current `.bxs` is flat only.)
-2. **Disassembly pane** — read-only instruction view at the cursor via
-   pure-Rust `yaxpeax-*`. The leap from "hex editor" to "RE tool". One curated,
-   feature-gated dependency. (Spec said heuristic-only; revisit deliberately.)
-3. **Firmware extraction / transforms** — decompress detected gzip/zlib/lzma/
-   zstd regions into a new tab; CyberChef-lite transform pipeline
-   (XOR/rotate/base64). Optional deps behind a cargo feature.
-4. **Search performance** — replace the naive O(n·m) scan with a memchr-style
-   skip / Boyer-Moore for snappy large-file search.
+Milestone C polish (Marks UX + side-pane):
+- **Marks tab is now a collapsible tree** (`marks.rs` builds it from the dotted/
+  indexed labels). Indented by depth; structs/arrays auto-collapse after
+  `:applystruct`. Folds: `za` toggle at cursor, `zR` expand all, `zM` collapse
+  all. Rendering is windowed for speed.
+- **Template side tab** (`:template`/`:defs`) renders the loaded `.bxs`
+  definitions via `Template::describe()`.
+- **Side-pane header is a carousel**: single row, scrolls to keep the active
+  tab centred, clamped (no wrap-around), with `<`/`>` edge indicators.
+  `Tab`/`Shift-Tab` cycle. `SideTab::ORDER` is the single source of order.
+  (Replaced the multi-row wrapping strip.)
+- Workflow extras: `:applystruct <name> [offset|label]` (apply without seeking);
+  re-apply clears the struct namespace first (no orphan marks); `:unmark <name>`
+  removes a whole applied struct; `:reloadstructs` re-reads the `.bxs` sidecar;
+  `.bxs` parse errors carry `line N` (lexer tracks lines). Milestone C complete.
+
+Milestone D — search performance + transform pipeline:
+- **Faster search** (`search.rs`): replaced the per-byte scan with wildcard-aware
+  **Boyer-Moore-Horspool** (bad-character skip table over the concrete suffix;
+  trailing `??` stripped and re-added to match length; degenerate all-wildcard
+  handled). Overlay-aware. 256MB wildcard search ≈ 320ms. Randomized test
+  cross-checks against a brute-force reference; overlapping matches handled.
+- **Transform pipeline** (`transform.rs` + Transform side tab): CyberChef-style
+  recipe over a selection. Built-in pure-Rust ops (hex/base64/url, xor/add/sub/
+  not/rol/ror, reverse, swap16/32/64, rot13, upper/lower, take/drop, md5/sha1/
+  sha256/crc32). Two custom-transform escape hatches: **`pipe <cmd>`** (streams
+  bytes through any external program via `sh -c`, writer-thread to avoid
+  deadlock) and **named recipes in `~/.bxpipes`** (`name = op | op`). Keys/cmds:
+  `T`/`:transform [name]`, `:t <op>`, `:tpop`, `:tclear`, `:tsave <f>`,
+  `:tpatch` (overwrite output back into the buffer), `:pipelines`. Output cached
+  on edit (never per-frame, since pipe spawns processes); tab shows recipe +
+  hex/ascii + "as text" preview. SideTab order now has 8 entries (Transform
+  after Strings).
+
+# Decisions / scope notes
+- **In-place extraction / decompression is intentionally OUT.** bxx is a
+  companion to binwalk (extraction) and ghidra/equivalents (disassembly), not a
+  do-everything tool. `pipe zcat`/`pipe unsquashfs` covers ad-hoc decompression
+  without bundling codecs. (User decision, milestone D.)
+- **Full disassembly pane is OUT.** bxx is a companion to Ghidra/IDA/Binary
+  Ninja, not a competitor in the disassembly/decompilation space. (User decision,
+  milestone E.) The *only* disasm we might ever add is a tiny optional
+  single-instruction decode under the cursor in the Inspector — not a pane, not
+  a feature we lead with.
+- **Guiding north star:** make the RE *fast in the terminal*, then hand off
+  cleanly to Ghidra/binwalk. "Triage here, deep-dive there."
+
+# Roadmap
+
+## Milestone E (DONE) — triage & Ghidra hand-off + file overview
+1. **Structural triage pane** — `analysis/triage.rs` + Triage side tab.
+   Parses ELF (32/64, LE/BE): segments, sections, symbols (.symtab/.dynsym),
+   imports (undefined dynsyms), needed libs (DT_NEEDED). Display order puts
+   high-signal info (libs/imports) first, the big symbol list last. `J`/`K`
+   move the highlight, `Enter` (`triage_jump`) jumps the hex cursor to the
+   entry's file offset. Cached per-doc (`triage`/`triage_sel`), cleared on
+   reanalyze. Pure structure — NO disasm. (PE/Mach-O still TODO.)
+2. **File overview minimap** — `ui/minimap.rs`, a 2-col strip carved off the
+   RIGHT of the hex view (not in diff mode; only when width allows). Whole file
+   → column height, tinted by entropy (own `minimap_cache` keyed by row count
+   to avoid thrashing the Entropy tab's cache), annotations highlighted, `┃`
+   viewport bracket + `▶` cursor marker. Config `minimap = on|off` in `.bxrc`.
+3. **Ghidra / radare2 bridge** — `bridge.rs`; `:export-ghidra <f>` (Jython:
+   createLabel + setEOLComment) and `:export-r2 <f>` (`f`/`CCu`). Recreates
+   marks + bookmarks at the right ADDRESSES: file offset→vaddr via the triage
+   `Report::off_to_vaddr` (ELF LOAD segments); offsets outside any LOAD are
+   skipped/counted. Verified: offset 0x25D10 → addr 0x26D10 on /bin/ls.
+   Labels sanitized to [A-Za-z0-9_]; comments one-lined.
+   **STATUS: PROTOTYPE / experimental** (user decision) — works in the common
+   case but not deeply tested across binaries/tool versions; flagged as such in
+   the README. Don't treat offset→addr translation or script output as
+   guaranteed-correct yet; needs hardening before it's load-bearing.
+
+## Milestone F (DONE — 1.0 shipped) — smarter diff + polish + release
+COMPLETED: search history (↑/↓), case-insensitive (`i"…"`) + scoped (`v` then
+`/`) + feature-gated regex (`re:`) search; yank/paste/fill (`y`/`p`/`:fill`,
+OSC52 clipboard); built-in `.bxs` templates (`builtins.rs`: elf64/32, png/gif/
+bmp/zip/gzip) merged into every doc; alignment-aware diff (`diff.rs` difflib
+matching-blocks → per-side hunks + similarity %, positional fallback >2MiB);
+`--version`; robustness sweep (no panics, batch + TUI). Release prep: Cargo.toml
+metadata (v1.0.0, MIT OR Apache-2.0, repo/keywords/categories/rust-version 1.87/
+exclude), LICENSE-MIT + LICENSE-APACHE, CHANGELOG.md, README front-page;
+`cargo publish --dry-run` passes (40 files, CLAUDE.md excluded).
+NOTE: crate+binary = `bxx` (file formats kept `.bx*`); `bx` was taken on
+crates.io. Repo = github.com/evinlodder/bx. Not yet committed/published — user
+to commit + `cargo publish` (needs their crates.io token).
+
+Original plan/decisions for reference:
+Decisions: **license = MIT OR Apache-2.0** (dual). **regex = feature-gated**
+(pure-Rust `regex` behind a cargo feature, OFF by default; standard build stays
+tiny). **clipboard = OSC52** (escape sequence, no dep, works over SSH).
+
+Part 1 — smarter diff:
+- Alignment-aware diff (rolling-hash / content-defined anchors) that survives
+  inserted/deleted bytes, not just positional. Similarity % in status bar.
+  Diff two regions within one file. Keep positional diff as a fast fallback;
+  cap the alignment work and degrade gracefully on huge files.
+
+Part 2 — polish bundle:
+- Search: history (↑/↓ recall of `/` and `:` queries), search-in-selection/
+  range, case-insensitive string search. Regex (`/re:…`) behind the feature.
+- Editing: `y` yank selection to clipboard via OSC52 (hex / C-array / raw /
+  base64); `:fill <hex>` fill a selection; paste/overwrite yanked bytes.
+- Built-in `.bxs` templates embedded for common formats (ELF/PE/PNG/ZIP/GIF) so
+  `:applystruct elf64` works with no sidecar.
+- (optional/low-pri) session restore.
+
+Part 3 — 1.0 ship checklist:
+- Cargo.toml metadata: description, license = "MIT OR Apache-2.0", repository,
+  homepage, keywords, categories, readme, rust-version (edition 2024 ⇒ ≥1.85),
+  exclude. Add LICENSE-MIT + LICENSE-APACHE. Version → 1.0.0. CHANGELOG.md.
+- `--version` flag. Robustness/no-panic sweep on truncated/malformed/empty/huge
+  inputs. README finalized as the crates.io front page (cargo install, features,
+  the prototype + AI-generated disclaimers, license section).
+- `cargo publish --dry-run`. NOTE: crate name `bxx` may be taken on crates.io —
+  user to confirm / pick a fallback (bxhex, bxx-hex, …) before publishing.

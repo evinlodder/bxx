@@ -78,15 +78,14 @@ pub struct Region {
     pub label: String,
     #[serde(rename = "type")]
     pub rtype: RegionType,
+    /// Optional decoded hint (enum variant name, bitfield breakdown, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Region {
     pub fn len(&self) -> u64 {
         self.end.saturating_sub(self.start)
-    }
-
-    pub fn contains(&self, offset: u64) -> bool {
-        (self.start..self.end).contains(&offset)
     }
 
     /// Decode the region's current bytes into a display string.
@@ -247,6 +246,7 @@ mod tests {
             end: 20,
             label: "magic".into(),
             rtype: RegionType::U32Le,
+            note: None,
         }];
         let dir = std::env::temp_dir().join(format!("bx-bxatest-{}", std::process::id()));
         std::fs::write(&dir, b"x").unwrap();

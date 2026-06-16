@@ -5,7 +5,7 @@
 //! active document so the rest of the code can keep saying `app.buf` etc.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::diff::{self, Hunk};
 use crate::export::FileInfo;
 use crate::search::SearchState;
-use crate::structs::StructDef;
+use crate::structs::Template;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -39,37 +39,69 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideTab {
     Marks,
+    Template,
     Inspect,
     Strings,
+    Triage,
+    Transform,
     Analysis,
     Entropy,
     Output,
 }
 
 impl SideTab {
+    /// Display order, for the tab strip and next/prev cycling.
+    pub const ORDER: [SideTab; 9] = [
+        Self::Marks,
+        Self::Template,
+        Self::Inspect,
+        Self::Strings,
+        Self::Triage,
+        Self::Transform,
+        Self::Analysis,
+        Self::Entropy,
+        Self::Output,
+    ];
+
+    fn index(self) -> usize {
+        Self::ORDER.iter().position(|&t| t == self).unwrap_or(0)
+    }
+
     pub fn next(self) -> Self {
-        match self {
-            Self::Marks => Self::Inspect,
-            Self::Inspect => Self::Strings,
-            Self::Strings => Self::Analysis,
-            Self::Analysis => Self::Entropy,
-            Self::Entropy => Self::Output,
-            Self::Output => Self::Marks,
-        }
+        Self::ORDER[(self.index() + 1) % Self::ORDER.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        Self::ORDER[(self.index() + Self::ORDER.len() - 1) % Self::ORDER.len()]
     }
 }
 
 /// Selections larger than this are truncated before brute-force analysis.
 const XOR_CAP: usize = 1 << 20;
 const CYCLIC_CAP: usize = 4 << 20;
+/// Cap on the OSC52 clipboard payload (terminals limit how much they accept).
+const CLIPBOARD_CAP: usize = 1 << 20;
+
+/// How `y` / `:yank` renders a selection onto the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YankFmt {
+    Hex,
+    CArray,
+    Raw,
+    Base64,
+}
 
 /// Everything tied to one open file.
 pub struct Document {
     pub buf: FileBuffer,
     pub diff_buf: Option<FileBuffer>,
     pub diff_hunks: Vec<Hunk>,
+    /// Hunks in the *other* file's coordinates (alignment-aware diff).
+    pub diff_hunks_b: Vec<Hunk>,
+    pub diff_similarity: f64,
+    pub diff_aligned: bool,
     pub annotations: Vec<Region>,
-    pub structs: HashMap<String, StructDef>,
+    pub template: Template,
     pub search: SearchState,
     pub magic_hits: Vec<MagicHit>,
     pub magic_truncated: bool,
@@ -101,6 +133,22 @@ pub struct Document {
     pub strings_utf16: bool,
     /// Case-insensitive substring filter applied to the Strings tab.
     pub strings_filter: String,
+    /// Paths of collapsed groups in the Marks tree.
+    pub collapsed: HashSet<String>,
+    /// Collapsed nodes in the Template tab (source keys + `source\0name`);
+    /// `template_sel` is the highlighted foldable node.
+    pub template_collapsed: HashSet<String>,
+    pub template_sel: usize,
+    /// Transform pipeline: input range, recipe (op strings), cached output.
+    pub tx_input: Option<(u64, u64)>,
+    pub tx_recipe: Vec<String>,
+    pub tx_output: Option<Result<Vec<u8>, String>>,
+    /// Structural triage (sections/symbols/imports), cached; `triage_sel` is
+    /// the highlighted row in the Triage tab.
+    pub triage: Option<crate::analysis::triage::Report>,
+    pub triage_sel: usize,
+    /// Whole-file entropy bucketed to the minimap height, keyed by row count.
+    pub minimap_cache: Option<(usize, Vec<(u64, f64)>)>,
 }
 
 impl Document {
@@ -110,8 +158,11 @@ impl Document {
             buf,
             diff_buf: None,
             diff_hunks: Vec::new(),
+            diff_hunks_b: Vec::new(),
+            diff_similarity: 1.0,
+            diff_aligned: true,
             annotations: Vec::new(),
-            structs: HashMap::new(),
+            template: Template::default(),
             search: SearchState::default(),
             magic_hits: Vec::new(),
             magic_truncated: false,
@@ -141,10 +192,25 @@ impl Document {
             strings_min: 4,
             strings_utf16: false,
             strings_filter: String::new(),
+            collapsed: HashSet::new(),
+            template_collapsed: HashSet::new(),
+            template_sel: 0,
+            tx_input: None,
+            tx_recipe: Vec::new(),
+            tx_output: None,
+            triage: None,
+            triage_sel: 0,
+            minimap_cache: None,
         };
         doc.reanalyze();
         doc.detect_ptr_defaults();
+        // Built-in templates first, so a user's <file>.bxs can override by name.
+        if let Ok(mut tpl) = crate::structs::parse(crate::builtins::BUILTINS) {
+            tpl.set_source("built-in");
+            doc.template.merge(tpl);
+        }
         doc.load_sidecars();
+        doc.autocollapse_template();
         Ok(doc)
     }
 
@@ -196,6 +262,9 @@ impl Document {
         self.arch_truncated = arch_trunc;
         self.entropy_cache = None;
         self.strings_cache = None;
+        self.triage = None;
+        self.triage_sel = 0;
+        self.minimap_cache = None;
     }
 
     fn load_sidecars(&mut self) {
@@ -220,10 +289,72 @@ impl Document {
         };
         if let Ok(text) = std::fs::read_to_string(&bxs) {
             match crate::structs::parse(&text) {
-                Ok(map) => self.structs.extend(map),
+                Ok(mut tpl) => {
+                    tpl.set_source(&bxs.file_name().unwrap_or(bxs.as_os_str()).to_string_lossy());
+                    self.template.merge(tpl);
+                }
                 Err(e) => self.output_lines.push(format!("bxs parse failed: {e}")),
             }
         }
+    }
+
+    // --- Template tab folding -------------------------------------------------
+
+    /// Visible foldable nodes in display order: each source key, then (if that
+    /// source is expanded) `source\0name` for each definition under it.
+    pub fn template_fold_nodes(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut last: Option<String> = None;
+        for e in self.template.entries() {
+            if last.as_deref() != Some(e.source.as_str()) {
+                keys.push(e.source.clone());
+                last = Some(e.source.clone());
+            }
+            if !self.template_collapsed.contains(&e.source) {
+                keys.push(format!("{}\0{}", e.source, e.name));
+            }
+        }
+        keys
+    }
+
+    /// Default view: source groups open, individual definitions collapsed.
+    pub fn autocollapse_template(&mut self) {
+        self.template_collapsed = self
+            .template
+            .entries()
+            .into_iter()
+            .map(|e| format!("{}\0{}", e.source, e.name))
+            .collect();
+        self.template_sel = 0;
+    }
+
+    pub fn template_move(&mut self, delta: isize) {
+        let n = self.template_fold_nodes().len() as isize;
+        if n > 0 {
+            self.template_sel = (self.template_sel as isize + delta).clamp(0, n - 1) as usize;
+        }
+    }
+
+    pub fn template_fold_toggle(&mut self) {
+        let keys = self.template_fold_nodes();
+        if let Some(key) = keys.get(self.template_sel).cloned() {
+            if !self.template_collapsed.remove(&key) {
+                self.template_collapsed.insert(key);
+            }
+        }
+    }
+
+    pub fn template_expand_all(&mut self) {
+        self.template_collapsed.clear();
+    }
+
+    pub fn template_collapse_all(&mut self) {
+        let mut set = HashSet::new();
+        for e in self.template.entries() {
+            set.insert(e.source.clone());
+            set.insert(format!("{}\0{}", e.source, e.name));
+        }
+        self.template_collapsed = set;
     }
 
     /// File info + analysis summary; feeds the Analysis tab and --batch mode.
@@ -292,10 +423,25 @@ pub struct App {
     pub pending_g: Option<String>,
     /// Awaiting a bookmark key: `Some(true)` to set, `Some(false)` to jump.
     pub pending_mark: Option<bool>,
+    /// Awaiting a fold command after `z`.
+    pub pending_z: bool,
     pub cmdline: String,
     pub message: String,
     pub side_tab: SideTab,
     pub side_scroll: u16,
+    /// Named transform recipes loaded from `~/.bxpipes`.
+    pub pipelines: std::collections::HashMap<String, Vec<String>>,
+    /// `/` and `:` input history; `hist_idx`/`hist_stash` drive ↑/↓ recall.
+    pub history_search: Vec<String>,
+    pub history_cmd: Vec<String>,
+    pub hist_idx: Option<usize>,
+    pub hist_stash: String,
+    /// Raw bytes from the last yank, for `:paste` / `p` (survives across files).
+    pub yank_register: Vec<u8>,
+    /// Text to push to the system clipboard via OSC52 on the next loop tick.
+    pub pending_copy: Option<Vec<u8>>,
+    /// When `/` is started from a visual selection, restrict hits to it.
+    pub search_scope: Option<(u64, u64)>,
     pub quit: bool,
 }
 
@@ -323,10 +469,19 @@ impl App {
             mode: Mode::Normal,
             pending_g: None,
             pending_mark: None,
+            pending_z: false,
             cmdline: String::new(),
             message: String::new(),
             side_tab: SideTab::Analysis,
             side_scroll: 0,
+            pipelines: std::collections::HashMap::new(),
+            history_search: Vec::new(),
+            history_cmd: Vec::new(),
+            hist_idx: None,
+            hist_stash: String::new(),
+            yank_register: Vec::new(),
+            pending_copy: None,
+            search_scope: None,
             quit: false,
         };
         app.message = format!(
@@ -418,6 +573,7 @@ impl App {
         self.side_scroll = 0;
         self.pending_g = None;
         self.pending_mark = None;
+        self.pending_z = false;
     }
 
     pub fn save_annotations(&mut self) {
@@ -503,6 +659,41 @@ impl App {
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
+        // A pending fold command (after `z`) consumes the next key.
+        if self.pending_z {
+            self.pending_z = false;
+            // Fold the Template tab if that's what's showing, else the Marks tree.
+            if self.side_tab == SideTab::Template {
+                match key.code {
+                    KeyCode::Char('a') => self.template_fold_toggle(),
+                    KeyCode::Char('R') => {
+                        self.template_expand_all();
+                        self.message = "expanded all".into();
+                    }
+                    KeyCode::Char('M') => {
+                        self.template_collapse_all();
+                        self.message = "collapsed all".into();
+                    }
+                    _ => self.message.clear(),
+                }
+                return;
+            }
+            self.side_tab = SideTab::Marks;
+            self.side_scroll = 0;
+            match key.code {
+                KeyCode::Char('a') => self.fold_toggle(),
+                KeyCode::Char('R') => {
+                    self.collapsed.clear();
+                    self.message = "expanded all folds".into();
+                }
+                KeyCode::Char('M') => {
+                    self.collapse_all();
+                    self.message = "collapsed all folds".into();
+                }
+                _ => self.message.clear(),
+            }
+            return;
+        }
         // A pending bookmark key (after `m` or `` ` ``) consumes the next char.
         if let Some(set) = self.pending_mark.take() {
             match key.code {
@@ -600,6 +791,8 @@ impl App {
                 self.cmdline.clear();
             }
             KeyCode::Char('/') => {
+                // `/` from a visual selection scopes the search to it.
+                self.search_scope = self.selection();
                 self.leave_visual();
                 self.mode = Mode::Search;
                 self.cmdline.clear();
@@ -675,6 +868,26 @@ impl App {
                 }
                 self.run_checksum(range);
             }
+            KeyCode::Char('T') => {
+                let range = self.selection_or_last();
+                if self.mode == Mode::Visual {
+                    self.leave_visual();
+                    self.mode = Mode::Normal;
+                }
+                self.start_transform(range, None);
+            }
+            KeyCode::Char('y') => {
+                let range = self.selection_or_last();
+                if self.mode == Mode::Visual {
+                    self.leave_visual();
+                    self.mode = Mode::Normal;
+                }
+                match range {
+                    Some(r) => self.yank(r, YankFmt::Hex),
+                    None => self.message = "no selection (v to select)".into(),
+                }
+            }
+            KeyCode::Char('p') if !ctrl => self.paste(),
             KeyCode::Char('m') if self.mode == Mode::Visual => {
                 let (s, e) = self.selection().unwrap();
                 self.leave_visual();
@@ -700,8 +913,26 @@ impl App {
                 self.side_tab = self.side_tab.next();
                 self.side_scroll = 0;
             }
-            KeyCode::Char('J') => self.side_scroll = self.side_scroll.saturating_add(1),
-            KeyCode::Char('K') => self.side_scroll = self.side_scroll.saturating_sub(1),
+            KeyCode::BackTab => {
+                self.side_tab = self.side_tab.prev();
+                self.side_scroll = 0;
+            }
+            KeyCode::Char('z') => {
+                self.pending_z = true;
+                self.message = "z: a toggle fold · R expand all · M collapse all".into();
+            }
+            KeyCode::Char('J') => match self.side_tab {
+                SideTab::Triage => self.triage_move(1),
+                SideTab::Template => self.template_move(1),
+                _ => self.side_scroll = self.side_scroll.saturating_add(1),
+            },
+            KeyCode::Char('K') => match self.side_tab {
+                SideTab::Triage => self.triage_move(-1),
+                SideTab::Template => self.template_move(-1),
+                _ => self.side_scroll = self.side_scroll.saturating_sub(1),
+            },
+            KeyCode::Enter if self.side_tab == SideTab::Triage => self.triage_jump(),
+            KeyCode::Enter if self.side_tab == SideTab::Template => self.template_fold_toggle(),
             KeyCode::Char('<') => {
                 self.config.anno_width = self.config.anno_width.saturating_sub(2).max(15);
             }
@@ -759,40 +990,100 @@ impl App {
     }
 
     fn handle_line_input(&mut self, key: KeyEvent) {
+        let search = self.mode == Mode::Search;
         match key.code {
             KeyCode::Esc => {
                 self.cmdline.clear();
+                self.hist_idx = None;
                 self.mode = Mode::Normal;
             }
             KeyCode::Backspace => {
+                self.hist_idx = None;
                 if self.cmdline.pop().is_none() {
                     self.mode = Mode::Normal;
                 }
             }
+            KeyCode::Up => self.history_step(search, true),
+            KeyCode::Down => self.history_step(search, false),
             KeyCode::Enter => {
                 let line = std::mem::take(&mut self.cmdline);
-                let was_search = self.mode == Mode::Search;
+                self.hist_idx = None;
+                self.push_history(search, &line);
                 self.mode = Mode::Normal;
-                if was_search {
+                if search {
                     self.execute_search(&line);
                 } else {
                     crate::commands::execute(self, &line);
                 }
             }
-            KeyCode::Char(c) => self.cmdline.push(c),
+            KeyCode::Char(c) => {
+                self.hist_idx = None;
+                self.cmdline.push(c);
+            }
             _ => {}
         }
+    }
+
+    fn push_history(&mut self, search: bool, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let hist = if search {
+            &mut self.history_search
+        } else {
+            &mut self.history_cmd
+        };
+        if hist.last().map(String::as_str) != Some(line) {
+            hist.push(line.to_string());
+        }
+    }
+
+    /// ↑/↓ through the relevant history, stashing the in-progress line.
+    fn history_step(&mut self, search: bool, back: bool) {
+        let len = if search {
+            self.history_search.len()
+        } else {
+            self.history_cmd.len()
+        };
+        if len == 0 {
+            return;
+        }
+        let next = match (self.hist_idx, back) {
+            (None, true) => {
+                self.hist_stash = self.cmdline.clone();
+                Some(len - 1)
+            }
+            (None, false) => return,
+            (Some(0), true) => Some(0),
+            (Some(i), true) => Some(i - 1),
+            (Some(i), false) if i + 1 < len => Some(i + 1),
+            (Some(_), false) => None, // past the newest → restore stash
+        };
+        self.hist_idx = next;
+        self.cmdline = match next {
+            Some(i) if search => self.history_search[i].clone(),
+            Some(i) => self.history_cmd[i].clone(),
+            None => std::mem::take(&mut self.hist_stash),
+        };
     }
 
     // --- actions ----------------------------------------------------------------
 
     pub fn execute_search(&mut self, query: &str) {
+        let scope = self.search_scope;
         match crate::search::run_search(&self.buf, query) {
-            Ok(state) => {
+            Ok(mut state) => {
+                if let Some((lo, hi)) = scope {
+                    state.hits.retain(|&(s, e)| s >= lo && e <= hi);
+                }
                 let n = state.hits.len();
                 self.search = state;
+                let scope_note = match scope {
+                    Some((lo, hi)) => format!(" in 0x{lo:X}..0x{hi:X}"),
+                    None => String::new(),
+                };
                 if n == 0 {
-                    self.message = format!("no matches for {query}");
+                    self.message = format!("no matches for {query}{scope_note}");
                 } else {
                     // Jump to the first hit at or after the cursor.
                     let from = self.cursor;
@@ -805,7 +1096,7 @@ impl App {
                     self.search.current = idx;
                     let (s, _) = self.search.hits[idx];
                     self.jump_to(s);
-                    self.message = format!("{n} match(es) | n/N to cycle");
+                    self.message = format!("{n} match(es){scope_note} | n/N to cycle");
                 }
             }
             Err(e) => self.message = format!("search: {e}"),
@@ -956,12 +1247,52 @@ impl App {
         self.message = format!("checksums computed ({n} bytes)");
     }
 
+    // --- Marks tree folding ---------------------------------------------------
+
+    /// Toggle the fold containing the cursor (vim `za`).
+    fn fold_toggle(&mut self) {
+        let forest = crate::marks::build(&self.annotations);
+        match crate::marks::fold_target(&forest, &self.collapsed, self.cursor) {
+            Some(path) => {
+                if self.collapsed.remove(&path) {
+                    self.message = format!("expand {path}");
+                } else {
+                    self.collapsed.insert(path.clone());
+                    self.message = format!("collapse {path}");
+                }
+            }
+            None => self.message = "no fold at cursor".into(),
+        }
+    }
+
+    /// Collapse every group, including top-level structs (vim `zM`).
+    fn collapse_all(&mut self) {
+        let forest = crate::marks::build(&self.annotations);
+        self.collapsed = crate::marks::group_paths(&forest, 0).into_iter().collect();
+    }
+
+    /// Collapse arrays and nested structs but leave top-level structs open.
+    /// Called after `:applystruct` so a fresh parse reads as a tidy tree.
+    pub fn autocollapse_marks(&mut self) {
+        let forest = crate::marks::build(&self.annotations);
+        self.collapsed = crate::marks::group_paths(&forest, 1).into_iter().collect();
+    }
+
     pub fn start_diff(&mut self, path: &Path) -> Result<(), String> {
         let other = FileBuffer::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        self.diff_hunks = diff::compute(self.buf.raw(), other.raw(), 4);
-        let n = self.diff_hunks.len();
+        let result = diff::diff(self.buf.raw(), other.raw());
+        let n = result.a_hunks.len() + result.b_hunks.len();
+        let (sim, aligned) = (result.similarity, result.aligned);
+        self.diff_hunks = result.a_hunks;
+        self.diff_hunks_b = result.b_hunks;
+        self.diff_similarity = sim;
+        self.diff_aligned = aligned;
         self.diff_buf = Some(other);
-        self.message = format!("diff: {n} hunk(s) | n/N to jump, :diffoff to close");
+        self.message = format!(
+            "diff: {:.1}% similar, {n} hunk(s){} | n/N to jump, :diffoff to close",
+            sim * 100.0,
+            if aligned { "" } else { " (positional — too large to align)" }
+        );
         Ok(())
     }
 
@@ -1100,6 +1431,188 @@ impl App {
             let computed =
                 crate::analysis::strings::extract(self.buf.raw(), self.strings_min, self.strings_utf16);
             self.strings_cache = Some(computed);
+        }
+    }
+
+    // --- transform pipeline ---------------------------------------------------
+
+    /// Begin a transform with the given input range (or the last selection /
+    /// whole file), optionally loading a named pipeline. Switches to the tab.
+    pub fn start_transform(&mut self, range: Option<(u64, u64)>, pipeline: Option<&str>) {
+        let input = range
+            .or(self.selection())
+            .or(self.last_selection)
+            .unwrap_or((0, self.buf.len()));
+        self.tx_input = Some(input);
+        if let Some(name) = pipeline {
+            match self.pipelines.get(name).cloned() {
+                Some(recipe) => self.tx_recipe = recipe,
+                None => {
+                    self.message = format!("no pipeline '{name}' (see ~/.bxpipes / :pipelines)");
+                    return;
+                }
+            }
+        }
+        self.recompute_transform();
+        self.side_tab = SideTab::Transform;
+        self.side_scroll = 0;
+        let (s, e) = input;
+        self.message = format!("transform input 0x{s:X}..0x{e:X} ({} B)", e - s);
+    }
+
+    /// Re-run the recipe over the input bytes and cache the result. Only called
+    /// on explicit edits (never per-frame), since `pipe` ops spawn processes.
+    pub fn recompute_transform(&mut self) {
+        let Some((s, e)) = self.tx_input else {
+            self.tx_output = None;
+            return;
+        };
+        let input = self.buf.get_range(s, (e.saturating_sub(s)) as usize);
+        self.tx_output = Some(crate::transform::run(&self.tx_recipe, &input));
+    }
+
+    pub fn transform_push(&mut self, op: &str) {
+        if self.tx_input.is_none() {
+            self.start_transform(None, None);
+        }
+        self.tx_recipe.push(op.trim().to_string());
+        self.recompute_transform();
+        self.side_tab = SideTab::Transform;
+        self.message = format!("+ {op}");
+    }
+
+    pub fn transform_pop(&mut self) {
+        if self.tx_recipe.pop().is_some() {
+            self.recompute_transform();
+            self.message = "removed last op".into();
+        } else {
+            self.message = "recipe is empty".into();
+        }
+    }
+
+    pub fn transform_clear(&mut self) {
+        self.tx_recipe.clear();
+        self.recompute_transform();
+        self.message = "cleared recipe".into();
+    }
+
+    /// Current transform output bytes, if the recipe ran cleanly.
+    pub fn transform_output(&self) -> Option<&[u8]> {
+        match &self.tx_output {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    // --- yank / paste / fill --------------------------------------------------
+
+    /// Copy a range to the clipboard (OSC52, rendered per `fmt`) and stash the
+    /// raw bytes for `:paste`.
+    pub fn yank(&mut self, range: (u64, u64), fmt: YankFmt) {
+        let (s, e) = range;
+        let data = self.buf.get_range(s, (e.saturating_sub(s)) as usize);
+        let n = data.len();
+        let text: Vec<u8> = match fmt {
+            YankFmt::Hex => data
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .into_bytes(),
+            YankFmt::CArray => {
+                let inner = data
+                    .iter()
+                    .map(|b| format!("0x{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ {inner} }}").into_bytes()
+            }
+            YankFmt::Base64 => crate::transform::b64_encode(&data),
+            YankFmt::Raw => data.clone(),
+        };
+        self.yank_register = data;
+        let capped = text.len() > CLIPBOARD_CAP;
+        self.pending_copy = Some(text.into_iter().take(CLIPBOARD_CAP).collect());
+        let what = match fmt {
+            YankFmt::Hex => "hex",
+            YankFmt::CArray => "C array",
+            YankFmt::Raw => "raw",
+            YankFmt::Base64 => "base64",
+        };
+        self.message = format!(
+            "yanked {n} byte(s) as {what}{}",
+            if capped { " (clipboard truncated)" } else { "" }
+        );
+    }
+
+    /// Overwrite bytes at the cursor from the yank register (`p` / `:paste`).
+    pub fn paste(&mut self) {
+        if self.yank_register.is_empty() {
+            self.message = "nothing to paste (yank with y first)".into();
+            return;
+        }
+        let reg = self.yank_register.clone();
+        let start = self.cursor;
+        let max = self.buf.len().saturating_sub(start) as usize;
+        let n = reg.len().min(max);
+        for (i, &b) in reg.iter().take(n).enumerate() {
+            self.buf.set(start + i as u64, b);
+        }
+        self.buf.commit_group();
+        self.message = format!(
+            "pasted {n} byte(s) @ 0x{start:X}{} (:w to save)",
+            if n < reg.len() { " (clamped to EOF)" } else { "" }
+        );
+    }
+
+    /// Fill `range` with a repeating byte pattern (`:fill`).
+    pub fn fill(&mut self, range: (u64, u64), pattern: &[u8]) {
+        if pattern.is_empty() {
+            self.message = "fill: empty pattern".into();
+            return;
+        }
+        let (s, e) = range;
+        for i in 0..(e.saturating_sub(s)) {
+            self.buf
+                .set(s + i, pattern[(i as usize) % pattern.len()]);
+        }
+        self.buf.commit_group();
+        self.message = format!("filled 0x{s:X}..0x{e:X} (:w to save)");
+    }
+
+    // --- structural triage ----------------------------------------------------
+
+    pub fn ensure_triage(&mut self) {
+        if self.triage.is_none() {
+            self.triage = crate::analysis::triage::analyze(self.buf.raw());
+        }
+    }
+
+    /// Move the highlighted triage row (J/K on the Triage tab).
+    pub fn triage_move(&mut self, delta: isize) {
+        self.ensure_triage();
+        if let Some(rep) = &self.triage {
+            let n = rep.entries.len() as isize;
+            if n > 0 {
+                self.triage_sel = (self.triage_sel as isize + delta).clamp(0, n - 1) as usize;
+            }
+        }
+    }
+
+    /// Jump the hex cursor to the selected triage entry's file offset (Enter).
+    pub fn triage_jump(&mut self) {
+        self.ensure_triage();
+        let target = self
+            .triage
+            .as_ref()
+            .and_then(|rep| rep.entries.get(self.triage_sel))
+            .and_then(|e| e.offset);
+        match target {
+            Some(off) => {
+                self.jump_to(off);
+                self.message = format!("→ 0x{off:X}");
+            }
+            None => self.message = "this entry has no file offset".into(),
         }
     }
 

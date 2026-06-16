@@ -14,6 +14,8 @@ struct ReportRegion<'a> {
     #[serde(rename = "type")]
     rtype: String,
     value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +55,7 @@ pub fn write_report(
                 label: &r.label,
                 rtype: r.rtype.to_string(),
                 value: r.decode(buf),
+                note: r.note.clone(),
             })
             .collect(),
     };

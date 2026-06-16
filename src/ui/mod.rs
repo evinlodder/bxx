@@ -3,6 +3,7 @@
 mod annopane;
 mod hexview;
 mod infobar;
+mod minimap;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -45,6 +46,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (main, None)
     };
 
+    // Carve a thin minimap strip off the right of the hex area (not in diff
+    // mode, and only when there's room to spare).
+    let want_minimap =
+        app.config.minimap && app.diff_buf.is_none() && hex_area.width > minimap::WIDTH + 50;
+    let (hex_area, minimap_area) = if want_minimap {
+        let [h, m] = Layout::horizontal([
+            Constraint::Min(20),
+            Constraint::Length(minimap::WIDTH),
+        ])
+        .areas(hex_area);
+        (h, Some(m))
+    } else {
+        (hex_area, None)
+    };
+
     app.view_rows = hex_area.height.saturating_sub(2).max(1) as usize;
 
     if app.diff_buf.is_some() {
@@ -55,6 +71,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         hexview::render(frame, right, app, hexview::Side::DiffRight);
     } else {
         hexview::render(frame, hex_area, app, hexview::Side::Main);
+    }
+
+    if let Some(mut m) = minimap_area {
+        // Align the strip with the hex rows (inside the hex view's border).
+        m.y += 1;
+        m.height = m.height.saturating_sub(2);
+        minimap::render(frame, m, app);
     }
 
     if let Some(side) = side_area {
